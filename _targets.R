@@ -4,6 +4,7 @@ if (!require(librarian)) {
 pkgs <- c(
   "sf",
   "targets",
+  "tarchetypes",
   "qs2",
   "dplyr"
 )
@@ -34,6 +35,22 @@ tar_config_set(store = file.path(store, "targets"))
 
 tar_source("R/assign_trip_ids.R")
 
+data_ais_layers <- list(
+  month = c("2023-11", paste0("2024-", sprintf("%02d", 4:10)))
+)
+
+mapped_data_ais_layers <- tar_map(
+  values = data_ais_layers,
+  tar_target(
+    name = data_ais,
+    command = st_read(
+      file.path(store, "data", "SEGS_INT_Mortality.gpkg"),
+      month
+    ) |>
+      assign_trip_ids(grid, data_ports)
+  )
+)
+
 list(
   tar_target(
     name = grid,
@@ -45,16 +62,10 @@ list(
     command = st_read(file.path(store, "data", "Grid.gpkg"), "Ports_100mBuffer")
   ),
 
-  tar_target(
-    name = data_ais,
-    command = st_read(
-      file.path(store, "data", "SEGS_INT_Mortality.gpkg"),
-      "2023-11"
-    )
-  ),
-
-  tar_target(
+  mapped_data_ais_layers,
+  tar_combine(
     name = processed_ais,
-    command = assign_trip_ids(data_ais, grid, data_ports)
+    mapped_data_ais_layers,
+    command = bind_rows(!!!.x)
   )
 )
