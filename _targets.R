@@ -7,6 +7,7 @@ pkgs <- c(
   "targets",
   "tarchetypes",
   "qs2",
+  "tidyr",
   "dplyr"
 )
 
@@ -164,8 +165,14 @@ mapped_data_ais_layers <- tar_map(
         mutate(
           MortMedian_5p_sd_MC = sqrt(MortMedian_5p_var_MC),
           MortMedian_10p_sd_MC = sqrt(MortMedian_10p_var_MC),
-          FMortMedian_5p = sum(MortMedian, MortMedian_5p, na.rm = TRUE),
-          FMortMedian_10p = sum(MortMedian, MortMedian_10p, na.rm = TRUE),
+          FMortMedian_5p = rowSums(
+            cbind(MortMedian, MortMedian_5p),
+            na.rm = TRUE
+          ),
+          FMortMedian_10p = rowSums(
+            cbind(MortMedian, MortMedian_10p),
+            na.rm = TRUE
+          ),
           Residual_risk_5p_perc2 = (MortMedian_5p / MortMedian) * 100, # GRID-cell percentages (new-old)/old
           Residual_risk_10p_perc2 = (MortMedian_10p / MortMedian) * 100 # GRID-cell percentages (new-old)/old
         )
@@ -236,14 +243,14 @@ mapped_data_ais_layers <- tar_map(
       )
 
       geo <- dplyr::right_join(
-        grid_sums,
+        Grid_sums,
         grid,
         by = "GRID_ID"
       ) |>
         sf::st_as_sf()
 
       sf::st_write(geo, paths$gpkg, layer = "polygons", delete_dsn = TRUE)
-      write.csv(grid_sums, paths$grid, row.names = FALSE)
+      write.csv(Grid_sums, paths$grid, row.names = FALSE)
       write.csv(delta_risk, paths$risk, row.names = FALSE)
 
       unlist(paths)
