@@ -3,3 +3,7 @@
 .RData
 .Ruserdata
 _targets.yaml
+.positai
+/data
+/final
+/targets

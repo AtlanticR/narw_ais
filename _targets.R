@@ -6,6 +6,7 @@ pkgs <- c(
   "sf",
   "targets",
   "tarchetypes",
+  "tibble",
   "qs2",
   "tidyr",
   "dplyr"
@@ -31,29 +32,93 @@ if (dir.exists("/srv/sambashare/NARW")) {
 ) {
   # on a windows machine on the sambashare
   store <- "//wpnsbio9039519.mar.dfo-mpo.ca/sambashare/NARW"
+} else {
+  store <-  getwd()
 }
 
 tar_config_set(store = file.path(store, "targets"))
 
 tar_source("R/assign_trip_ids.R")
 
-data_ais_layers <- list(
-  year_month = c("2023-11", paste0("2024-", sprintf("%02d", 4:10)))
+focus_ym <- c("2023-11", paste0("2024-", sprintf("%02d", 4:10)))
+data_ais_processed_layers <- tibble(
+  year_month = focus_ym,
+  data_ais = rlang::syms(paste0("data_ais_", gsub("-", ".", focus_ym)))
+)
+
+data_ais_all_layers <- list(
+  year_month = st_layers(file.path(store, "data", "SEGS_INT_Mortality.gpkg"))$name
 )
 
 mapped_data_ais_layers <- tar_map(
-  values = data_ais_layers,
+  values = data_ais_all_layers,
   tar_target(
     name = data_ais,
-    command = st_read(
+    command = {
+      ais <- st_read(
       file.path(store, "data", "SEGS_INT_Mortality.gpkg"),
       year_month
     ) |>
       assign_trip_ids(grid, data_ports) |>
       mutate(Type = ifelse(is.na(Type), "OTHER", Type)) |>
       filter(!(GRID_ID %in% remove_grid_ids))
+
+      # measure gaps
+
+      gaps <- ais |>
+        group_by(trip_id) |>
+        reframe(
+          geom = st_combine(geom)
+        )|>
+        mutate(
+          merged_geom = st_line_merge(geom),
+          has_gap     = st_geometry_type(merged_geom) == "MULTILINESTRING",
+          internal_gap = if_else(
+            has_gap,
+            vapply(merged_geom, \(geom) {
+              coords <- st_coordinates(geom)
+              l1     <- coords[, "L1"]
+              ends   <- coords[!duplicated(l1, fromLast = TRUE), c(1, 2), drop = FALSE]
+              starts <- coords[!duplicated(l1),                  c(1, 2), drop = FALSE]
+              n <- nrow(ends)
+              if (n <= 1L) return(0)
+              gaps <- vapply(seq_len(n - 1L), \(i) {
+                p <- rbind(ends[i, ], starts[i, ])
+                q <- rbind(ends[i+1L, ], starts[i+1L, ])
+                min(sqrt((p[,1] - q[1,1])^2 + (p[,2] - q[1,2])^2),
+                    sqrt((p[,1] - q[2,1])^2 + (p[,2] - q[2,2])^2),
+                    sqrt((p[1,1] - q[,1])^2 + (p[1,2] - q[,2])^2),
+                    sqrt((p[2,1] - q[,1])^2 + (p[2,2] - q[,2])^2))
+              }, numeric(1))
+              max(gaps)
+            }, numeric(1)),
+            0
+          ),
+          complete = internal_gap < 10000
+        ) |>
+        select(-merged_geom, -geom)
+
+      ais |> left_join(gaps, by = "trip_id")
+
+    }
   ),
 
+  tar_target(
+    name = trip_ids,
+    command = {
+      data_ais |>
+        sf::st_drop_geometry() |>
+        select(trip_id,Type) |>
+        distinct() |>
+        dplyr::mutate(year_month = year_month,
+                      year = as.numeric(substr(year_month,1,4)))
+    }
+  ))
+
+
+mapped_data_ais_layers_downstream <- tar_map(
+  values = data_ais_processed_layers,
+  names = year_month,
   tar_target(
     name = trip_nums,
     command = {
@@ -86,8 +151,9 @@ mapped_data_ais_layers <- tar_map(
       # data.table is much faster for this type of operation than data.frame, so convert to data.table
       data_ais_dt <- as.data.table(st_drop_geometry(data_ais))
 
-      # split the trip_ids by Type for sampling
-      trip_ids_by_type <- split(data_ais_dt$trip_id, data_ais_dt$Type)
+      # ensure selection of only 'complete' trips
+      # and split the trip_ids by Type for sampling
+            trip_ids_by_type <- split(data_ais_dt$trip_id[data_ais_dt$complete], data_ais_dt$Type[data_ais_dt$complete])
 
       # prepare array
       resultarray <- array(
@@ -463,7 +529,10 @@ list(
 
   tar_target(
     name = conversion_rates,
-    command = data.frame(
+    command = {
+
+
+      default <- data.frame(
       Type = c(
         "CARGO",
         "FERRY",
@@ -475,7 +544,7 @@ list(
         "TANKER",
         "TUG"
       ),
-      Annual_increase = c(
+      Annual_increase_default = c(
         2.094334579,
         2.978065767,
         2.978065767,
@@ -485,8 +554,28 @@ list(
         2.978065767,
         1.409169349,
         2.978065767
-      )
-    )
+      ))
+
+      conversion_rates_trip_ids |>
+        left_join(default, by = "Type") |>
+        mutate(if_else(Annual_increase<0, Annual_increase_default, Annual_increase))
+
+
+
+      }
+  ),
+
+  tar_target(
+    name = conversion_rates_trip_ids,
+    command = {
+      trip_ids_combined |>
+        group_by(year,Type) |>
+        reframe(n_trips = n()) |>
+        ungroup() |>
+        group_by(Type) |>
+        reframe(Annual_increase = mean((n_trips / lag(n_trips) - 1) * 100, na.rm = TRUE))
+
+    }
   ),
 
   tar_target(
@@ -494,5 +583,12 @@ list(
     command = c(0.05, 0.10) # this should only be 2 values or will break downstream code
   ),
 
-  mapped_data_ais_layers
+  mapped_data_ais_layers,
+  mapped_data_ais_layers_downstream,
+
+  tar_combine(
+    name = trip_ids_combined,
+    mapped_data_ais_layers[["trip_ids"]],
+    command = dplyr::bind_rows(!!!.x)
+  )
 )
