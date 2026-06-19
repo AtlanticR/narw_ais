@@ -3,6 +3,7 @@ if (!require(librarian)) {
 }
 pkgs <- c(
   "data.table",
+  "purrr",
   "sf",
   "targets",
   "tarchetypes",
@@ -40,39 +41,40 @@ tar_config_set(store = file.path(store, "targets"))
 
 tar_source("R/assign_trip_ids.R")
 
-focus_ym <- c("2023-11", paste0("2024-", sprintf("%02d", 4:10)))
-data_ais_processed_layers <- tibble(
-  year_month = focus_ym,
-  data_ais = rlang::syms(paste0("data_ais_", gsub("-", ".", focus_ym)))
+data_ais_layers <- tibble(
+  year_month = c("2023-09","2023-11", paste0("2024-", sprintf("%02d", 4:10)))
 )
 
-data_ais_all_layers <- list(
-  year_month = st_layers(file.path(store, "data", "SEGS_INT_Mortality.gpkg"))$name
-)
+data_ais_growth <- expand.grid(
+  year_month    = data_ais_layers$year_month,
+  target_growth = c(0.05, 0.1),
+  stringsAsFactors = FALSE
+) |>
+  mutate(
+    tg_label     = sprintf("%02d", target_growth * 100),  # "05", "10"
+    # data_ais = rlang::syms(paste0("data_ais_", gsub("-",".",year_month))),
+    data_whalestats = rlang::syms(paste0("data_whalestats_", gsub("-", ".", year_month)))
+  )
 
 mapped_data_ais_layers <- tar_map(
-  values = data_ais_all_layers,
+  values = data_ais_layers,
   tar_target(
     name = data_ais,
     command = {
       ais <- st_read(
-      file.path(store, "data", "SEGS_INT_Mortality.gpkg"),
-      year_month
-    ) |>
-      assign_trip_ids(grid, data_ports) |>
-      mutate(Type = ifelse(is.na(Type), "OTHER", Type)) |>
-      filter(!(GRID_ID %in% remove_grid_ids))
-
-      # measure gaps
+        file.path(store, "data", "SEGS_INT_Mortality.gpkg"),
+        year_month
+      ) |>
+        assign_trip_ids(grid, data_ports) |>
+        mutate(Type = ifelse(is.na(Type), "OTHER", Type)) |>
+        filter(!(GRID_ID %in% remove_grid_ids))
 
       gaps <- ais |>
         group_by(trip_id) |>
-        reframe(
-          geom = st_combine(geom)
-        )|>
+        reframe(geom = st_combine(geom)) |>
         mutate(
-          merged_geom = st_line_merge(geom),
-          has_gap     = st_geometry_type(merged_geom) == "MULTILINESTRING",
+          merged_geom  = st_line_merge(geom),
+          has_gap      = st_geometry_type(merged_geom) == "MULTILINESTRING",
           internal_gap = if_else(
             has_gap,
             vapply(merged_geom, \(geom) {
@@ -83,12 +85,14 @@ mapped_data_ais_layers <- tar_map(
               n <- nrow(ends)
               if (n <= 1L) return(0)
               gaps <- vapply(seq_len(n - 1L), \(i) {
-                p <- rbind(ends[i, ], starts[i, ])
-                q <- rbind(ends[i+1L, ], starts[i+1L, ])
-                min(sqrt((p[,1] - q[1,1])^2 + (p[,2] - q[1,2])^2),
-                    sqrt((p[,1] - q[2,1])^2 + (p[,2] - q[2,2])^2),
-                    sqrt((p[1,1] - q[,1])^2 + (p[1,2] - q[,2])^2),
-                    sqrt((p[2,1] - q[,1])^2 + (p[2,2] - q[,2])^2))
+                p <- rbind(ends[i, ],      starts[i, ])
+                q <- rbind(ends[i + 1L, ], starts[i + 1L, ])
+                min(
+                  sqrt((p[, 1] - q[1, 1])^2 + (p[, 2] - q[1, 2])^2),
+                  sqrt((p[, 1] - q[2, 1])^2 + (p[, 2] - q[2, 2])^2),
+                  sqrt((p[1, 1] - q[, 1])^2 + (p[1, 2] - q[, 2])^2),
+                  sqrt((p[2, 1] - q[, 1])^2 + (p[2, 2] - q[, 2])^2)
+                )
               }, numeric(1))
               max(gaps)
             }, numeric(1)),
@@ -99,149 +103,189 @@ mapped_data_ais_layers <- tar_map(
         select(-merged_geom, -geom)
 
       ais |> left_join(gaps, by = "trip_id")
+    }
+  ),
+
+
+  tar_target(
+    name = data_whaleresults_files,
+    command = list.files("data", full.names = TRUE, pattern = paste0("resultsIterations_",year_month,".*ffected\\.RData")),
+    format = "file"
+  ),
+
+  tar_target(
+    name = data_whaleresults_matrix,
+    command = {
+      if(length(data_whaleresults_files)>0){
+        all_mats <- map(data_whaleresults_files, function(file) {
+          load(file)
+          map(results, ~ map(.x, "MatrixOri")) |>
+            list_flatten() |>
+            compact()
+        }) |>
+          list_flatten()
+
+        combined <- do.call(cbind, all_mats)
+      } else {
+        NA
+      }
 
     }
   ),
 
   tar_target(
-    name = trip_ids,
+    name = data_whalestats,
     command = {
-      data_ais |>
-        sf::st_drop_geometry() |>
-        select(trip_id,Type) |>
-        distinct() |>
-        dplyr::mutate(year_month = year_month,
-                      year = as.numeric(substr(year_month,1,4)))
+      if(is.matrix(data_whaleresults_matrix)){
+        data.frame(
+          col_name = colnames(data_whaleresults_matrix),
+          MortMedian = as.numeric(apply(data_whaleresults_matrix, 2, median)),
+          MortVar = as.numeric(apply(data_whaleresults_matrix, 2, var))
+        ) |>
+          separate(col_name, into = c("mmsi","UNIX_start","GRID_ID","zone1","zone2","ym","extra"),
+                   sep = "_", remove = FALSE) |>
+          mutate(uniqID = paste(mmsi, UNIX_start, GRID_ID, sep = "_")) |>
+          left_join(data_ais |> select(uniqID,trip_id,complete,Type) |> st_drop_geometry(), by = "uniqID")
+      } else {
+        NA
+      }
+
     }
-  ))
+  )
+)
 
+mapped_outputs <- tar_map(
+  values = data_ais_growth,
+  names  = c(year_month, tg_label),
 
-mapped_data_ais_layers_downstream <- tar_map(
-  values = data_ais_processed_layers,
-  names = year_month,
   tar_target(
     name = trip_nums,
     command = {
-      trip_nums <- data_ais |>
-        st_drop_geometry() |>
-        group_by(Type) |>
-        summarise(unique_trips = n_distinct(trip_id, na.rm = TRUE)) |>
-        as.data.frame() |>
-        left_join(conversion_rates, by = "Type") |>
-        mutate(
-          growth_rate = Annual_increase / 100,
-          scaled_growth_rate1 = growth_rate *
-            (target_growth[1] /
-              sum(unique_trips / sum(unique_trips) * growth_rate)),
-          scaled_growth_rate2 = growth_rate *
-            (target_growth[2] /
-              sum(unique_trips / sum(unique_trips) * growth_rate)),
-          trip_growth_Nums1 = round(unique_trips * scaled_growth_rate1),
-          trip_growth_Nums2 = round(unique_trips * scaled_growth_rate2)
-        )
+      if(is.data.frame(data_whalestats)){
+        data_whalestats |>
+          group_by(Type) |>
+          summarise(unique_trips = n_distinct(trip_id, na.rm = TRUE)) |>
+          as.data.frame() |>
+          mutate(
+            growth_rate        = target_growth,
+            trip_growth_nums   = round(unique_trips * target_growth)
+          )
+      } else {
+        NA
+      }
     }
   ),
 
   tar_target(
-    name = mc_results,
+    name = mc_sampled_uniqID,
     command = {
-      n_iter = 10000 #TODO change to 10000
-      Grid_IDs <- unique(data_ais$GRID_ID)
+      if(is.data.frame(data_whalestats)){
+        n_iter    <- 100L  # TODO: change to 10000
+        Grid_IDs  <- unique(data_whalestats$GRID_ID)
+        data_whalestats_dt <- as.data.table(data_whalestats)
 
-      # data.table is much faster for this type of operation than data.frame, so convert to data.table
-      data_ais_dt <- as.data.table(st_drop_geometry(data_ais))
-
-      # ensure selection of only 'complete' trips
-      # and split the trip_ids by Type for sampling
-            trip_ids_by_type <- split(data_ais_dt$trip_id[data_ais_dt$complete], data_ais_dt$Type[data_ais_dt$complete])
-
-      # prepare array
-      resultarray <- array(
-        NA_real_,
-        dim = c(length(target_growth), length(Grid_IDs), ncol = n_iter),
-        dimnames = list(
-          target_growth = target_growth,
-          Grid_IDs = Grid_IDs,
-          n_iter = seq_len(n_iter)
+        trip_ids_by_type <- split(
+          data_whalestats_dt$trip_id[data_whalestats_dt$complete],
+          data_whalestats_dt$Type[data_whalestats_dt$complete]
         )
-      )
 
-      for (p in c(0.05, 0.10)) {
-        sample_sizes <- setNames(
-          if (p == target_growth[1]) {
-            trip_nums$trip_growth_Nums1
-          } else {
-            trip_nums$trip_growth_Nums2
-          },
-          trip_nums$Type
+        sample_sizes <- setNames(trip_nums$trip_growth_nums, trip_nums$Type)
+
+
+        sampled_trips <- lapply(seq_len(n_iter), function(i) {
+          unlist(mapply(
+            sample,
+            trip_ids_by_type,
+            sample_sizes[names(trip_ids_by_type)],
+            SIMPLIFY = FALSE
+          ))
+
+        })
+
+      } else {
+        NA
+      }
+
+    }
+  ),
+
+  tar_target(
+    name = mc_result_matrix,
+    command = {
+      if(is.data.frame(data_whalestats)){
+        Grid_IDs    <- unique(data_whalestats$GRID_ID)
+        data_whalestats_dt <- as.data.table(st_drop_geometry(data_whalestats))
+        n_iter      <- length(mc_sampled_uniqID)
+
+        result_matrix <- matrix(
+          NA_real_,
+          nrow     = length(Grid_IDs),
+          ncol     = n_iter,
+          dimnames = list(Grid_IDs = Grid_IDs, n_iter = seq_len(n_iter))
         )
         for (i in seq_len(n_iter)) {
-          if (i %% n_iter / 10 == 0) {
-            message(
-              "MC iteration: ",
-              i,
-              " of ",
-              n_iter,
-              " for target growth: ",
-              p
-            )
-          }
+          if (i %% (n_iter / 10) == 0)
+            message("MC iteration: ", i, " of ", n_iter,
+                    " | growth: ", target_growth,
+                    " | ", year_month)
 
-          sampled_ids <- unlist(
-            mapply(
-              sample,
-              trip_ids_by_type,
-              sample_sizes[names(trip_ids_by_type)],
-              SIMPLIFY = FALSE
-            )
-          )
-
-          temp <- data_ais_dt[
-            trip_id %in% sampled_ids,
+          temp <- data_whalestats_dt[
+            trip_id %in% mc_sampled_uniqID[[i]],
             .(MortMedian = sum(MortMedian, na.rm = TRUE)),
             by = GRID_ID
           ]
-
-          resultarray[target_growth == p, temp$GRID_ID, i] <- temp$MortMedian
+          result_matrix[temp$GRID_ID, i] <- temp$MortMedian
         }
+        result_matrix
+      } else {
+        NA
       }
 
-      resultarray
+
     }
   ),
+
+  tar_target(
+    name = mc_stats,
+    command = {
+      if(is.data.frame(data_whalestats)){
+        # na.rm = TRUE handles grid cells with no vessel traffic in some iterations
+        list(
+          median = apply(mc_result_matrix, 1, median, na.rm = TRUE),
+          mean   = apply(mc_result_matrix, 1, mean,   na.rm = TRUE),
+          p10    = apply(mc_result_matrix, 1, quantile, probs = 0.10, na.rm = TRUE),
+          p90    = apply(mc_result_matrix, 1, quantile, probs = 0.90, na.rm = TRUE),
+          cv     = apply(mc_result_matrix, 1, function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE))
+        )
+      } else {
+        NA
+      }
+
+    }
+  ),
+
 
   tar_target(
     name = Grid_sums,
     command = {
       grid_base <- as.data.table(st_drop_geometry(data_ais))[,
-        .(
-          MortMedian = sum(MortMedian, na.rm = TRUE),
-          MortVar = sum(MortVar, na.rm = TRUE)
-        ),
-        by = GRID_ID
+                                                             .(
+                                                               MortMedian = sum(MortMedian, na.rm = TRUE),
+                                                               MortVar    = sum(MortVar,    na.rm = TRUE)
+                                                             ),
+                                                             by = GRID_ID
       ]
 
-      Grid_sums <- data.frame(
-        GRID_ID = attr(mc_results, "dimnames")$Grid_IDs,
-        MortMedian_5p = apply(mc_results[1, , ], 1, median, na.rm = TRUE),
-        MortMedian_10p = apply(mc_results[2, , ], 1, median, na.rm = TRUE),
-        MortMedian_5p_var_MC = apply(mc_results[1, , ], 1, var, na.rm = TRUE),
-        MortMedian_10p_var_MC = apply(mc_results[2, , ], 1, var, na.rm = TRUE)
+      data.frame(
+        GRID_ID          = rownames(mc_stats),
+        MortMedian_MC    = apply(mc_stats, 1, median, na.rm = TRUE),
+        MortVar_MC       = apply(mc_stats, 1, var,    na.rm = TRUE)
       ) |>
         left_join(grid_base, by = "GRID_ID") |>
         mutate(
-          MortMedian_5p_sd_MC = sqrt(MortMedian_5p_var_MC),
-          MortMedian_10p_sd_MC = sqrt(MortMedian_10p_var_MC),
-          FMortMedian_5p = rowSums(
-            cbind(MortMedian, MortMedian_5p),
-            na.rm = TRUE
-          ),
-          FMortMedian_10p = rowSums(
-            cbind(MortMedian, MortMedian_10p),
-            na.rm = TRUE
-          ),
-          Residual_risk_5p_perc2 = (MortMedian_5p / MortMedian) * 100, # GRID-cell percentages (new-old)/old
-          Residual_risk_10p_perc2 = (MortMedian_10p / MortMedian) * 100 # GRID-cell percentages (new-old)/old
+          MortMedian_sd_MC = sqrt(MortVar_MC),
+          FMortMedian      = MortMedian + MortMedian_MC,
+          Residual_risk_perc = (MortMedian_MC / MortMedian) * 100
         )
     }
   ),
@@ -250,37 +294,28 @@ mapped_data_ais_layers_downstream <- tar_map(
     name = delta_risk,
     command = {
       gs <- Grid_sums
-      # Tag each grid cell with zone membership
       for (zone in names(zone_ids)) {
         gs[[zone]] <- as.integer(gs$GRID_ID %in% zone_ids[[zone]])
       }
-      gs[["Study_Area"]] <- 1L # all cells
+      gs[["Study_Area"]] <- 1L
 
-      zones <- c("Study_Area", names(zone_ids))
-
-      lapply(zones, function(zone) {
-        mask <- gs[[zone]]
-
-        old <- sum(gs$MortMedian * mask, na.rm = TRUE)
-        d5 <- sum(gs$MortMedian_5p * mask, na.rm = TRUE)
-        d10 <- sum(gs$MortMedian_10p * mask, na.rm = TRUE)
-        tot5 <- sum(gs$FMortMedian_5p * mask, na.rm = TRUE)
-        tot10 <- sum(gs$FMortMedian_10p * mask, na.rm = TRUE)
-
-        v_old <- sum(gs$MortVar * mask, na.rm = TRUE)
-        v5 <- sum(gs$MortMedian_5p_var_MC * mask, na.rm = TRUE)
-        v10 <- sum(gs$MortMedian_10p_var_MC * mask, na.rm = TRUE)
+      lapply(c("Study_Area", names(zone_ids)), function(zone) {
+        mask  <- gs[[zone]]
+        old   <- sum(gs$MortMedian   * mask, na.rm = TRUE)
+        delta <- sum(gs$MortMedian_MC * mask, na.rm = TRUE)
+        total <- sum(gs$FMortMedian  * mask, na.rm = TRUE)
+        v_old <- sum(gs$MortVar      * mask, na.rm = TRUE)
+        v_mc  <- sum(gs$MortVar_MC   * mask, na.rm = TRUE)
 
         data.frame(
-          Area = zone,
-          delta_risk_5p = d5,
-          delta_risk_5p_perc2 = d5 / old * 100,
-          error_5p = 100 *
-            sqrt(((tot5 / old^2)^2) * v_old + ((1 / v_old)^2) * v5),
-          delta_risk_10p = d10,
-          delta_risk_10p_perc2 = d10 / old * 100,
-          error_10p = 100 *
-            sqrt(((tot10 / old^2)^2) * v_old + ((1 / v_old)^2) * v10)
+          Area              = zone,
+          target_growth     = target_growth,
+          delta_risk        = delta,
+          delta_risk_perc   = delta / old * 100,
+          error             = 100 * sqrt(
+            ((total / old^2)^2) * v_old +
+              ((1     / v_old  )^2) * v_mc
+          )
         )
       }) |>
         bind_rows()
@@ -290,35 +325,23 @@ mapped_data_ais_layers_downstream <- tar_map(
   tar_target(
     name = outputs,
     command = {
-      ym <- gsub("-", "_", year_month)
       outdir <- file.path(store, "final")
       dir.create(outdir, showWarnings = FALSE)
 
+      growth_tag <- gsub("\\.", "p", as.character(target_growth))  # "0.05" -> "0p05"
+
       paths <- list(
-        gpkg = file.path(
-          outdir,
-          paste0("Increased_Traffic_FResidual_Risk_RGrid_", ym, ".gpkg")
-        ),
-        grid = file.path(
-          outdir,
-          paste0("Increased_Traffic_FGrid_sums_RGrid_", ym, ".csv")
-        ),
-        risk = file.path(
-          outdir,
-          paste0("Increased_Traffic_FDelta_Risk_RGrid_", ym, ".csv")
-        )
+        gpkg = file.path(outdir, paste0("Increased_Traffic_FResidual_Risk_RGrid_",  year_month, "_", growth_tag, ".gpkg")),
+        grid = file.path(outdir, paste0("Increased_Traffic_FGrid_sums_RGrid_",      year_month, "_", growth_tag, ".csv")),
+        risk = file.path(outdir, paste0("Increased_Traffic_FDelta_Risk_RGrid_",     year_month, "_", growth_tag, ".csv"))
       )
 
-      geo <- dplyr::right_join(
-        Grid_sums,
-        grid,
-        by = "GRID_ID"
-      ) |>
-        sf::st_as_sf()
+      dplyr::right_join(Grid_sums, grid, by = "GRID_ID") |>
+        sf::st_as_sf() |>
+        sf::st_write(paths$gpkg, layer = "polygons", delete_dsn = TRUE)
 
-      sf::st_write(geo, paths$gpkg, layer = "polygons", delete_dsn = TRUE)
-      write.csv(Grid_sums, paths$grid, row.names = FALSE)
-      write.csv(delta_risk, paths$risk, row.names = FALSE)
+      write.csv(Grid_sums,   paths$grid, row.names = FALSE)
+      write.csv(delta_risk,  paths$risk, row.names = FALSE)
 
       unlist(paths)
     },
@@ -528,67 +551,10 @@ list(
   ),
 
   tar_target(
-    name = conversion_rates,
-    command = {
-
-
-      default <- data.frame(
-      Type = c(
-        "CARGO",
-        "FERRY",
-        "FISHING",
-        "GOV_RES",
-        "OTHER",
-        "PASSENGER",
-        "PLEASURE",
-        "TANKER",
-        "TUG"
-      ),
-      Annual_increase_default = c(
-        2.094334579,
-        2.978065767,
-        2.978065767,
-        2.978065767,
-        2.978065767,
-        2.978065767,
-        2.978065767,
-        1.409169349,
-        2.978065767
-      ))
-
-      conversion_rates_trip_ids |>
-        left_join(default, by = "Type") |>
-        mutate(if_else(Annual_increase<0, Annual_increase_default, Annual_increase))
-
-
-
-      }
-  ),
-
-  tar_target(
-    name = conversion_rates_trip_ids,
-    command = {
-      trip_ids_combined |>
-        group_by(year,Type) |>
-        reframe(n_trips = n()) |>
-        ungroup() |>
-        group_by(Type) |>
-        reframe(Annual_increase = mean((n_trips / lag(n_trips) - 1) * 100, na.rm = TRUE))
-
-    }
-  ),
-
-  tar_target(
     name = target_growth,
     command = c(0.05, 0.10) # this should only be 2 values or will break downstream code
   ),
 
   mapped_data_ais_layers,
-  mapped_data_ais_layers_downstream,
-
-  tar_combine(
-    name = trip_ids_combined,
-    mapped_data_ais_layers[["trip_ids"]],
-    command = dplyr::bind_rows(!!!.x)
-  )
+  mapped_outputs
 )
