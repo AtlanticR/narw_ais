@@ -23,7 +23,10 @@ tar_option_set(
 )
 
 # get the path to the data store
-if (dir.exists("/srv/sambashare/NARW")) {
+if(dir.exists("//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/")) {
+  # on the NAS
+  store = "//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/SPA/NARW_AIS"
+  } else if (dir.exists("/srv/sambashare/NARW")) {
   # on a linux machine on the sambashare
   store = "/srv/sambashare/NARW"
 } else if (
@@ -42,7 +45,8 @@ tar_config_set(store = file.path(store, "targets"))
 tar_source("R/assign_trip_ids.R")
 
 data_ais_layers <- tibble(
-  year_month = c("2023-09","2023-11", paste0("2024-", sprintf("%02d", 4:10)))
+  # year_month = c("2023-11", paste0("2024-", sprintf("%02d", 4:10)))
+  year_month = c(paste0("2024-", sprintf("%02d", 8:9)))
 )
 
 data_ais_growth <- expand.grid(
@@ -53,7 +57,8 @@ data_ais_growth <- expand.grid(
   mutate(
     tg_label     = sprintf("%02d", target_growth * 100),  # "05", "10"
     # data_ais = rlang::syms(paste0("data_ais_", gsub("-",".",year_month))),
-    data_whalestats = rlang::syms(paste0("data_whalestats_", gsub("-", ".", year_month)))
+    data_whaleskey = rlang::syms(paste0("data_whaleskey_", gsub("-", ".", year_month))),
+    data_whaleresults_matrix = rlang::syms(paste0("data_whaleresults_matrix_", gsub("-", ".", year_month)))
   )
 
 mapped_data_ais_layers <- tar_map(
@@ -109,15 +114,23 @@ mapped_data_ais_layers <- tar_map(
 
   tar_target(
     name = data_whaleresults_files,
-    command = list.files("data", full.names = TRUE, pattern = paste0("resultsIterations_",year_month,".*ffected\\.RData")),
-    format = "file"
+    command = {
+      files <- list.files(file.path(store,"Increased_Traffic"), recursive = TRUE, full.names = TRUE, pattern = paste0("resultsIterations_",year_month,"INT_SEGS_.*\\.RData"))
+
+      tibble::tibble(
+        file = files,
+        size = file.info(files)$size
+      ) |>
+        filter(size <1000000000) #TODO remove 1gb filter
+
+      }
   ),
 
   tar_target(
     name = data_whaleresults_matrix,
     command = {
-      if(length(data_whaleresults_files)>0){
-        all_mats <- map(data_whaleresults_files, function(file) {
+      if(length(data_whaleresults_files$file)>0){
+        all_mats <- map(data_whaleresults_files$file, function(file) {
           load(file)
           map(results, ~ map(.x, "MatrixOri")) |>
             list_flatten() |>
@@ -134,13 +147,11 @@ mapped_data_ais_layers <- tar_map(
   ),
 
   tar_target(
-    name = data_whalestats,
+    name = data_whaleskey,
     command = {
       if(is.matrix(data_whaleresults_matrix)){
         data.frame(
-          col_name = colnames(data_whaleresults_matrix),
-          MortMedian = as.numeric(apply(data_whaleresults_matrix, 2, median)),
-          MortVar = as.numeric(apply(data_whaleresults_matrix, 2, var))
+          col_name = colnames(data_whaleresults_matrix)
         ) |>
           separate(col_name, into = c("mmsi","UNIX_start","GRID_ID","zone1","zone2","ym","extra"),
                    sep = "_", remove = FALSE) |>
@@ -161,8 +172,8 @@ mapped_outputs <- tar_map(
   tar_target(
     name = trip_nums,
     command = {
-      if(is.data.frame(data_whalestats)){
-        data_whalestats |>
+      if(is.data.frame(data_whaleskey)){
+        data_whaleskey |>
           group_by(Type) |>
           summarise(unique_trips = n_distinct(trip_id, na.rm = TRUE)) |>
           as.data.frame() |>
@@ -176,176 +187,119 @@ mapped_outputs <- tar_map(
     }
   ),
 
-  tar_target(
-    name = mc_sampled_uniqID,
-    command = {
-      if(is.data.frame(data_whalestats)){
-        n_iter    <- 100L  # TODO: change to 10000
-        Grid_IDs  <- unique(data_whalestats$GRID_ID)
-        data_whalestats_dt <- as.data.table(data_whalestats)
 
-        trip_ids_by_type <- split(
-          data_whalestats_dt$trip_id[data_whalestats_dt$complete],
-          data_whalestats_dt$Type[data_whalestats_dt$complete]
-        )
+  tar_target(
+    name = mc_sampled_mask,
+    command = {
+      if (is.data.frame(data_whaleskey)) {
+
+        n_iter <- 10000L
+        data_whaleskey_dt <- as.data.table(data_whaleskey)
+        stopifnot(nrow(data_whaleskey_dt) == ncol(data_whaleresults_matrix))
+
+        complete_dt <- data_whaleskey_dt[complete & !is.na(trip_id) & !is.na(Type)]
+        trip_lookup <- unique(complete_dt, by = c("Type", "trip_id"))
+
+        # unique trip_id per Type -- sampling must be at trip level, not
+        # AIS-record level, or long trips get oversampled
+        trip_ids_by_type <- split(trip_lookup$trip_id, trip_lookup$Type)
 
         sample_sizes <- setNames(trip_nums$trip_growth_nums, trip_nums$Type)
 
+        # precompute AIS-row indices per trip (columns of data_whaleresults_matrix)
+        ais_rows_by_trip <- split(seq_len(nrow(data_whaleskey_dt)), data_whaleskey_dt$trip_id)
 
-        sampled_trips <- lapply(seq_len(n_iter), function(i) {
-          unlist(mapply(
-            sample,
+        sampled_ais_rows <- lapply(seq_len(n_iter), function(i) {
+          sampled_trips <- unlist(mapply(
+            function(ids, n) sample(ids, size = min(n, length(ids))),
             trip_ids_by_type,
             sample_sizes[names(trip_ids_by_type)],
             SIMPLIFY = FALSE
-          ))
-
+          ), use.names = FALSE)
+          unlist(ais_rows_by_trip[sampled_trips], use.names = FALSE)
         })
 
+        Matrix::sparseMatrix(
+          i = unlist(sampled_ais_rows, use.names = FALSE),
+          j = rep.int(seq_len(n_iter), lengths(sampled_ais_rows)),
+          x = 1,
+          dims = c(nrow(data_whaleskey_dt), n_iter)
+        )
+
       } else {
         NA
       }
-
-    }
-  ),
-
-  tar_target(
-    name = mc_result_matrix,
-    command = {
-      if(is.data.frame(data_whalestats)){
-        Grid_IDs    <- unique(data_whalestats$GRID_ID)
-        data_whalestats_dt <- as.data.table(st_drop_geometry(data_whalestats))
-        n_iter      <- length(mc_sampled_uniqID)
-
-        result_matrix <- matrix(
-          NA_real_,
-          nrow     = length(Grid_IDs),
-          ncol     = n_iter,
-          dimnames = list(Grid_IDs = Grid_IDs, n_iter = seq_len(n_iter))
-        )
-        for (i in seq_len(n_iter)) {
-          if (i %% (n_iter / 10) == 0)
-            message("MC iteration: ", i, " of ", n_iter,
-                    " | growth: ", target_growth,
-                    " | ", year_month)
-
-          temp <- data_whalestats_dt[
-            trip_id %in% mc_sampled_uniqID[[i]],
-            .(MortMedian = sum(MortMedian, na.rm = TRUE)),
-            by = GRID_ID
-          ]
-          result_matrix[temp$GRID_ID, i] <- temp$MortMedian
-        }
-        result_matrix
-      } else {
-        NA
-      }
-
-
-    }
-  ),
-
-  tar_target(
-    name = mc_stats,
-    command = {
-      if(is.data.frame(data_whalestats)){
-        # na.rm = TRUE handles grid cells with no vessel traffic in some iterations
-        list(
-          median = apply(mc_result_matrix, 1, median, na.rm = TRUE),
-          mean   = apply(mc_result_matrix, 1, mean,   na.rm = TRUE),
-          p10    = apply(mc_result_matrix, 1, quantile, probs = 0.10, na.rm = TRUE),
-          p90    = apply(mc_result_matrix, 1, quantile, probs = 0.90, na.rm = TRUE),
-          cv     = apply(mc_result_matrix, 1, function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE))
-        )
-      } else {
-        NA
-      }
-
     }
   ),
 
 
   tar_target(
-    name = Grid_sums,
+    mc_results,
     command = {
-      grid_base <- as.data.table(st_drop_geometry(data_ais))[,
-                                                             .(
-                                                               MortMedian = sum(MortMedian, na.rm = TRUE),
-                                                               MortVar    = sum(MortVar,    na.rm = TRUE)
-                                                             ),
-                                                             by = GRID_ID
-      ]
+      mask <- as.matrix(mc_sampled_mask)
+      zones <- as.factor(paste0("zone_",data_whaleskey$zone1))
+      gridids <- as.factor(paste0("grid_",data_whaleskey$GRID_ID))
 
-      data.frame(
-        GRID_ID          = rownames(mc_stats),
-        MortMedian_MC    = apply(mc_stats, 1, median, na.rm = TRUE),
-        MortVar_MC       = apply(mc_stats, 1, var,    na.rm = TRUE)
-      ) |>
-        left_join(grid_base, by = "GRID_ID") |>
-        mutate(
-          MortMedian_sd_MC = sqrt(MortVar_MC),
-          FMortMedian      = MortMedian + MortMedian_MC,
-          Residual_risk_perc = (MortMedian_MC / MortMedian) * 100
-        )
-    }
-  ),
+      n_iter <- nrow(data_whaleresults_matrix)
 
-  tar_target(
-    name = delta_risk,
-    command = {
-      gs <- Grid_sums
-      for (zone in names(zone_ids)) {
-        gs[[zone]] <- as.integer(gs$GRID_ID %in% zone_ids[[zone]])
-      }
-      gs[["Study_Area"]] <- 1L
+      results_list <- vector("list", n_iter)
 
-      lapply(c("Study_Area", names(zone_ids)), function(zone) {
-        mask  <- gs[[zone]]
-        old   <- sum(gs$MortMedian   * mask, na.rm = TRUE)
-        delta <- sum(gs$MortMedian_MC * mask, na.rm = TRUE)
-        total <- sum(gs$FMortMedian  * mask, na.rm = TRUE)
-        v_old <- sum(gs$MortVar      * mask, na.rm = TRUE)
-        v_mc  <- sum(gs$MortVar_MC   * mask, na.rm = TRUE)
+      for(i in seq_len(n_iter)) {
+                if (i %% floor(n_iter / 10L) == 0L) {
+                  message(
+                    "iteration ", i, " of ", n_iter
+                  )
+                }
 
-        data.frame(
-          Area              = zone,
-          target_growth     = target_growth,
-          delta_risk        = delta,
-          delta_risk_perc   = delta / old * 100,
-          error             = 100 * sqrt(
-            ((total / old^2)^2) * v_old +
-              ((1     / v_old  )^2) * v_mc
+        maskedvessels <- mask * data_whaleresults_matrix[i]
+
+
+        vesselsbygroup <- rbind(rowsum(maskedvessels, group = zones, na.rm = TRUE),
+                                rowsum(maskedvessels, group = gridids, na.rm = TRUE))
+
+        results_list[[i]] <- tibble(
+          whale_iter = i,
+          group = rownames(vesselsbygroup),
+
+          vessel_iter_delta_mean = matrixStats::rowMeans2(
+            vesselsbygroup,
+            na.rm = TRUE
+          ),
+
+          vessel_iter_delta_median = matrixStats::rowMedians(
+            vesselsbygroup,
+            na.rm = TRUE
+          ),
+
+          vessel_iter_delta_variance = matrixStats::rowVars(
+            vesselsbygroup,
+            na.rm = TRUE
+          ),
+
+          vessel_iter_delta_q025 = matrixStats::rowQuantiles(
+            vesselsbygroup,
+            probs = 0.025,
+            na.rm = TRUE
+          ),
+
+          vessel_iter_delta_q975 = matrixStats::rowQuantiles(
+            vesselsbygroup,
+            probs = 0.975,
+            na.rm = TRUE
+          ),
+
+          vessel_iter_delta_n_delta_gt0 = matrixStats::rowCounts(
+            vesselsbygroup > 0,
+            value = TRUE,
+            na.rm = TRUE
           )
-        )
-      }) |>
-        bind_rows()
+        ) |>
+          separate(group, into = c("type", "id"), sep = "_", remove = TRUE)
+      }
+
+      data.table::rbindlist(results_list)
+
     }
-  ),
-
-  tar_target(
-    name = outputs,
-    command = {
-      outdir <- file.path(store, "final")
-      dir.create(outdir, showWarnings = FALSE)
-
-      growth_tag <- gsub("\\.", "p", as.character(target_growth))  # "0.05" -> "0p05"
-
-      paths <- list(
-        gpkg = file.path(outdir, paste0("Increased_Traffic_FResidual_Risk_RGrid_",  year_month, "_", growth_tag, ".gpkg")),
-        grid = file.path(outdir, paste0("Increased_Traffic_FGrid_sums_RGrid_",      year_month, "_", growth_tag, ".csv")),
-        risk = file.path(outdir, paste0("Increased_Traffic_FDelta_Risk_RGrid_",     year_month, "_", growth_tag, ".csv"))
-      )
-
-      dplyr::right_join(Grid_sums, grid, by = "GRID_ID") |>
-        sf::st_as_sf() |>
-        sf::st_write(paths$gpkg, layer = "polygons", delete_dsn = TRUE)
-
-      write.csv(Grid_sums,   paths$grid, row.names = FALSE)
-      write.csv(delta_risk,  paths$risk, row.names = FALSE)
-
-      unlist(paths)
-    },
-    format = "file"
   )
 )
 
