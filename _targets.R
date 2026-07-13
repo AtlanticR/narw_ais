@@ -10,6 +10,7 @@ pkgs <- c(
   "tarchetypes",
   "tibble",
   "qs2",
+  "crew",
   "tidyr",
   "dplyr"
 )
@@ -17,34 +18,20 @@ pkgs <- c(
 
 shelf(pkgs)
 
-
 tar_option_set(
+  # controller = crew_controller_group(
+  #   local = crew_controller_local(
+  #     workers = 8
+  #   )
+  # ),
   packages = basename(pkgs),
   format = "qs"
 )
 
 # get the path to the data store
-if(dir.exists("D:/Data_For_Remi/narw_ais")) {
-  # on the NAS
-  store = "D:/Data_For_Remi/narw_ais"
-} else if(dir.exists("//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/")) {
-  # on the NAS
-  store = "//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/SPA/NARW_AIS"
-} else if (dir.exists("/srv/sambashare/NARW")) {
-  # on a linux machine on the sambashare
-  store = "/srv/sambashare/NARW"
-} else if (
-  dir.exists(
-    "//wpnsbio9039519.mar.dfo-mpo.ca/sambashare/NARW"
-  )
-) {
-  # on a windows machine on the sambashare
-  store <- "//wpnsbio9039519.mar.dfo-mpo.ca/sambashare/NARW"
-} else {
-  store <-  getwd()
-}
+source("R/get_store.R")
 
-tar_config_set(store = file.path(store, "targets"))
+tar_config_set(store = file.path(get_store(), "targets"))
 
 tar_source("R/assign_trip_ids.R")
 
@@ -55,7 +42,7 @@ data_ais_layers <- tibble(
 
 data_ais_zones <- expand.grid(
   year_month    = data_ais_layers$year_month,
-  zones = sub(".*SEGS_([^_]+)_Unaffected.*", "\\1",list.files(file.path(store,"..","Increased_Traffic"), recursive = TRUE, full.names = TRUE, pattern = paste0("resultsIterations_2024-08.*\\.RData"))),
+  zones = sub(".*SEGS_([^_]+)_Unaffected.*", "\\1",list.files(file.path(get_store(),"Increased_Traffic"), recursive = TRUE, full.names = TRUE, pattern = paste0("resultsIterations_2024-08.*\\.RData"))),
   stringsAsFactors = FALSE
 ) |>
   mutate(
@@ -113,7 +100,7 @@ mapped_data_ais_layers <- tar_map(
     name = data_ais,
     command = {
       ais <- st_read(
-        file.path(store, "data", "SEGS_INT_Mortality.gpkg"),
+        file.path(get_store(), "data", "SEGS_INT_Mortality.gpkg"),
         year_month
       ) |>
         assign_trip_ids(grid, data_ports) |>
@@ -167,13 +154,14 @@ mapped_data_ais_zones <- tar_map(
   tar_target(
     name = data_whaleresults_files,
     command = {
-      files <- list.files(file.path(store,"..","Increased_Traffic"), recursive = TRUE, full.names = TRUE, pattern = paste0("resultsIterations_",year_month,"INT_SEGS_",zones,".*\\.RData"))
+      files <- gsub(get_store(),"",list.files(file.path(get_store(),"Increased_Traffic"), recursive = TRUE, full.names = TRUE, pattern = paste0("resultsIterations_",year_month,"INT_SEGS_",zones,".*\\.RData")))
+
 
       tibble::tibble(
-        file = files,
-        size = file.info(files)$size
+        file = files#,
+        # size = file.info(files)$size
       ) #|>
-        #filter(size <1000000000) #TODO remove 1gb filter
+      #filter(size <1000000000) #TODO remove 1gb filter
 
     }
   ),
@@ -183,7 +171,7 @@ mapped_data_ais_zones <- tar_map(
     command = {
       if(length(data_whaleresults_files$file)>0){
         all_mats <- map(data_whaleresults_files$file, function(file) {
-          load(file)
+          load(file.path(get_store(),file))
           map(results, ~ map(.x, "MatrixOri")) |>
             list_flatten() |>
             compact()
@@ -574,7 +562,7 @@ mapped_outputs <- tar_map(
               na.rm = TRUE
             )
           ) |>
-            separate(group, into = c("type", "id"), sep = "_", remove = TRUE)
+            separate(group, into = c("type", "GRID_ID"), sep = "_", remove = TRUE)
         }
 
         data.table::rbindlist(results_list)
@@ -591,7 +579,7 @@ mapped_outputs <- tar_map(
 list(
   tar_target(
     name = grid,
-    command = st_read(file.path(store, "data", "Grid.gpkg"), "GridGulf")
+    command = st_read(file.path(get_store(), "data", "Grid.gpkg"), "GridGulf")
   ),
 
   tar_target(
@@ -757,7 +745,7 @@ list(
   tar_target(
     name = zone_ids,
     command = {
-      path <- file.path(store, "data", "Grid.gpkg")
+      path <- file.path(get_store(), "data", "Grid.gpkg")
 
       layers <- sf::st_layers(path)$name
       read_ids <- function(lyr, path) {
@@ -785,7 +773,7 @@ list(
 
   tar_target(
     name = data_ports,
-    command = st_read(file.path(store, "data", "Grid.gpkg"), "Ports_100mBuffer")
+    command = st_read(file.path(get_store(), "data", "Grid.gpkg"), "Ports_100mBuffer")
   ),
 
   tar_target(
