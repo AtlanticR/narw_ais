@@ -626,7 +626,7 @@ mapped_outputs <- tar_map(
   ),
 
   # thin extraction targets -- no recomputation, just indexing the cached list
-  tar_target(mc_zone_stats, mc_results$zone_stats),
+  tar_target(mc_single_zone_stats, mc_results$zone_stats),
   tar_target(mc_unique_grid_stats, mc_results$unique_grid_stats),
   tar_target(mc_grid_raw_path, mc_results$grid_raw_path)
 )
@@ -736,7 +736,7 @@ mc_zone_stats_targets <- lapply(
   unique(data_grid_combine_values$ym_tg),
   function(grp) {
     sub <- data_grid_combine_values[data_grid_combine_values$ym_tg == grp, ]
-    target_names <- paste0("mc_results_", grp, "_", sub$zones)
+    target_names <- paste0("mc_single_zone_stats_", grp, "_", sub$zones)
 
     do.call(
       tar_combine,
@@ -830,7 +830,7 @@ list(
   combined_trip_counts_targets,
   mapped_trip_nums,
   mapped_mc_sampling,
-  mapped_outputs,                   # now produces mc_results -> mc_zone_stats, mc_unique_grid_stats, mc_grid_raw_path
+  mapped_outputs,                   # now produces mc_results -> mc_single_zone_stats, mc_unique_grid_stats, mc_grid_raw_path
   mc_unique_grid_combined_targets,  # NEW: bind_rows of already-final unique-cell stats
   mc_grid_combined_targets,         # NEW: duckdb-combined shared-cell raw values
   mc_shared_grid_stats_targets,     # NEW: matrixStats on combined shared cells
