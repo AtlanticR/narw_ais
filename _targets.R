@@ -12,7 +12,10 @@ pkgs <- c(
   "qs2",
   "crew",
   "tidyr",
-  "dplyr"
+  "dplyr",
+  "arrow",
+  "duckdb",
+  "DBI"
 )
 
 
@@ -21,7 +24,7 @@ shelf(pkgs)
 tar_option_set(
   # controller = crew_controller_group(
   #   local = crew_controller_local(
-  #     workers = 8
+  #     workers = 2
   #   )
   # ),
   packages = basename(pkgs),
@@ -69,7 +72,6 @@ data_ais_growth <- expand.grid(
         tg_label
       )
     ),
-
     mc_sampled_trips = rlang::syms(
       paste0(
         "mc_sampled_trips_",
@@ -77,7 +79,9 @@ data_ais_growth <- expand.grid(
         "_",
         tg_label
       )
-    )
+    ),
+    # NEW: each zone branch gets a reference to its month's shared-grid-id vector
+    shared_grid_ids = rlang::syms(paste0("shared_grid_ids_", gsub("-", ".", year_month)))
   )
 
 data_mc_sampling_values <- tidyr::crossing(
@@ -143,10 +147,7 @@ mapped_data_ais_layers <- tar_map(
       ais |> left_join(gaps, by = "trip_id")
     }
   )
-
 )
-
-
 
 mapped_data_ais_zones <- tar_map(
   values = data_ais_zones,
@@ -156,13 +157,9 @@ mapped_data_ais_zones <- tar_map(
     command = {
       files <- gsub(get_store(),"",list.files(file.path(get_store(),"Increased_Traffic"), recursive = TRUE, full.names = TRUE, pattern = paste0("resultsIterations_",year_month,"INT_SEGS_",zones,".*\\.RData")))
 
-
       tibble::tibble(
-        file = files#,
-        # size = file.info(files)$size
-      ) #|>
-      #filter(size <1000000000) #TODO remove 1gb filter
-
+        file = files
+      )
     }
   ),
 
@@ -182,7 +179,6 @@ mapped_data_ais_zones <- tar_map(
       } else {
         NA
       }
-
     }
   ),
 
@@ -200,14 +196,11 @@ mapped_data_ais_zones <- tar_map(
       } else {
         NA
       }
-
     }
   )
 )
 
-
-# Recursively flatten a tar_map() result into a flat list of tar_target objects,
-# no matter how deeply nested (safe regardless of unlist= behavior)
+# Recursively flatten a tar_map() result into a flat list of tar_target objects
 flatten_targets <- function(x) {
   if (inherits(x, "tar_target")) {
     return(list(x))
@@ -218,11 +211,8 @@ flatten_targets <- function(x) {
   list()
 }
 
-# Given a tar_map() result, its "values" tibble, a grouping column (e.g.
-# year_month), and a target-name prefix (e.g. "data_whaleskey"), build one
-# tar_combine() per group value that binds together all the mapped targets
-# belonging to that group. This is the shared helper behind allwhales_targets
-# and combined_trip_counts_targets below.
+# Given a tar_map() result, its "values" tibble, a grouping column, and a
+# target-name prefix, build one tar_combine() per group value.
 build_group_combine_targets <- function(mapped_result, values, group_col, name_prefix, out_prefix, extra_cols = character(0)) {
   targets_flat <- flatten_targets(mapped_result)
   target_lookup <- setNames(
@@ -272,6 +262,24 @@ build_group_combine_targets <- function(mapped_result, values, group_col, name_p
   )
 }
 
+# NEW: combine shared-grid-cell raw parquet files across zones via duckdb
+combine_grid_raw_duckdb <- function(paths) {
+  paths <- paths[!is.na(paths)]
+  if (length(paths) == 0) return(NA)
+
+  con <- DBI::dbConnect(duckdb::duckdb())
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+
+  glob <- paste0("['", paste(paths, collapse = "','"), "']")
+
+  DBI::dbGetQuery(con, sprintf(
+    "SELECT GRID_ID, vessel_iter, iteration, SUM(value) AS value
+     FROM read_parquet(%s)
+     GROUP BY GRID_ID, whale_iter",
+    glob
+  ))
+}
+
 allwhales_targets <- build_group_combine_targets(
   mapped_result = mapped_data_ais_zones,
   values        = data_ais_zones,
@@ -279,6 +287,25 @@ allwhales_targets <- build_group_combine_targets(
   name_prefix   = "data_whaleskey",
   out_prefix    = "data_allwhaleskey",
   extra_cols    = "zones"
+)
+
+# NEW: identify grid cells that appear in more than one zone, per year_month
+data_shared_grid_values <- data_ais_layers |>
+  mutate(
+    data_allwhaleskey = rlang::syms(paste0("data_allwhaleskey_", gsub("-", ".", year_month)))
+  )
+
+mapped_shared_grid <- tar_map(
+  values = data_shared_grid_values,
+  names  = year_month,
+  tar_target(
+    shared_grid_ids,
+    command = {
+      as.data.table(data_allwhaleskey)[
+        , .(n_zones = uniqueN(zone1)), by = GRID_ID
+      ][n_zones > 1, GRID_ID]
+    }
+  )
 )
 
 data_trip_counts_values <- data_ais_zones |>
@@ -305,9 +332,6 @@ mapped_trip_counts <- tar_map(
   )
 )
 
-# Combine unique_trip_counts across zones, one target per year_month, so
-# trip_nums can be mapped over year_month only instead of (year_month, zones,
-# tg_label).
 combined_trip_counts_targets <- build_group_combine_targets(
   mapped_result = mapped_trip_counts,
   values        = data_trip_counts_values,
@@ -322,8 +346,6 @@ data_trip_nums_values <- data_ais_layers |>
     unique_trip_counts_combined = rlang::syms(paste0("unique_trip_counts_combined_", gsub("-", ".", year_month)))
   )
 
-# trip_nums is now mapped by year_month only: each target holds trip counts
-# and growth targets for every target_growth for that month.
 mapped_trip_nums <- tar_map(
   values = data_trip_nums_values,
   names  = year_month,
@@ -354,7 +376,6 @@ mapped_mc_sampling <- tar_map(
   tar_target(
     mc_sampled_trips,
     {
-
       n_iter <- 10000L
 
       trip_ids_by_type <- split(
@@ -376,16 +397,13 @@ mapped_mc_sampling <- tar_map(
       sampled_indices <- lapply(
         seq_len(n_iter),
         function(i) {
-
           unlist(
             mapply(
               function(ids, n) {
-
                 sample(
                   ids,
                   size = min(n, length(ids))
                 )
-
               },
               trip_ids_by_type,
               sample_sizes[names(trip_ids_by_type)],
@@ -393,7 +411,6 @@ mapped_mc_sampling <- tar_map(
             ),
             use.names = FALSE
           )
-
         }
       )
 
@@ -409,7 +426,6 @@ mapped_mc_sampling <- tar_map(
           n_iter
         )
       )
-
     }
   ),
 
@@ -429,6 +445,8 @@ mapped_mc_sampling <- tar_map(
   )
 )
 
+# computes zone stats, finalizes unique (non-shared) grid cell stats
+# in-memory, and writes only shared grid cells' raw values to parquet.
 mapped_outputs <- tar_map(
   values = data_ais_growth,
   names  = c(year_month, tg_label, zones),
@@ -437,7 +455,6 @@ mapped_outputs <- tar_map(
     mc_sampled_mask,
     {
       if (is.data.frame(data_whaleskey)) {
-
 
         whales_dt <- as.data.table(data_whaleskey)
 
@@ -485,96 +502,252 @@ mapped_outputs <- tar_map(
       } else {
         NA
       }
-
     }
   ),
-
 
   tar_target(
     mc_results,
     command = {
       if (is.data.frame(data_whaleskey)) {
-        mask <- as.matrix(mc_sampled_mask)
+        # mask <- as.matrix(mc_sampled_mask)
+        idx <- Matrix::summary(mc_sampled_mask)
 
-        zone_groups <- as.factor(
-          paste0("zone_", data_whaleskey$zone1)
-        )
-
-        grid_groups <- as.factor(
-          paste0("grid_", data_whaleskey$GRID_ID)
-        )
+        zone_groups <- as.factor(data_whaleskey$zone1)
+        grid_groups <- as.factor(data_whaleskey$GRID_ID)
+        grid_id_levels <- levels(grid_groups)
+        is_shared <- grid_id_levels %in% shared_grid_ids
 
         n_iter <- nrow(data_whaleresults_matrix)
 
-        results_list <- vector("list", n_iter)
+        zone_results_list    <- vector("list", n_iter)
+        unique_grid_raw_list <- vector("list", n_iter)
+        shared_grid_raw_list <- vector("list", n_iter)
 
-        for(i in seq_len(n_iter)) {
+        for (i in seq_len(n_iter)) {
           if (i %% floor(n_iter / 10L) == 0L) {
-            message(
-              "iteration ", i, " of ", n_iter
-            )
+            message("iteration ", i, " of ", n_iter)
           }
 
-          maskedvessels <- mask * data_whaleresults_matrix[i,]
+          # maskedvessels <- mask * data_whaleresults_matrix[i, ]
+          maskedvessels <- matrix(NA_real_,
+                                  nrow = nrow(mc_sampled_mask),
+                                  ncol = ncol(mc_sampled_mask))
 
+          maskedvessels[cbind(idx$i, idx$j)] <- data_whaleresults_matrix[i, ][idx$i]
 
-
-          vesselsbygroup <- rbind(
-            rowsum(maskedvessels, group = zone_groups, na.rm = TRUE),
-            rowsum(maskedvessels, group = grid_groups, na.rm = TRUE)
-          )
-
-
-          results_list[[i]] <- tibble(
+          # zone stats -- unchanged logic, computed immediately per iteration
+          vesselsbygroup <- rowsum(maskedvessels, group = zone_groups, na.rm = TRUE)
+          zone_results_list[[i]] <- tibble(
             whale_iter = i,
             group = rownames(vesselsbygroup),
+            vessel_iter_delta_mean = matrixStats::rowMeans2(vesselsbygroup, na.rm = TRUE),
+            vessel_iter_delta_median = matrixStats::rowMedians(vesselsbygroup, na.rm = TRUE),
+            vessel_iter_delta_variance = matrixStats::rowVars(vesselsbygroup, na.rm = TRUE),
+            vessel_iter_delta_q025 = matrixStats::rowQuantiles(vesselsbygroup, probs = 0.025, na.rm = TRUE),
+            vessel_iter_delta_q975 = matrixStats::rowQuantiles(vesselsbygroup, probs = 0.975, na.rm = TRUE),
+            vessel_iter_delta_n_delta_gt0 = matrixStats::rowCounts(vesselsbygroup > 0, value = TRUE, na.rm = TRUE)
+          )
 
-            vessel_iter_delta_mean = matrixStats::rowMeans2(
-              vesselsbygroup,
-              na.rm = TRUE
-            ),
+          # grid -- one rowsum, then split by shared vs. unique
+          gridsum <- rowsum(maskedvessels, group = grid_groups, na.rm = TRUE)
 
-            vessel_iter_delta_median = matrixStats::rowMedians(
-              vesselsbygroup,
-              na.rm = TRUE
-            ),
+          unique_grid_raw_list[[i]] <- gridsum[!is_shared, , drop = FALSE]
 
-            vessel_iter_delta_variance = matrixStats::rowVars(
-              vesselsbygroup,
-              na.rm = TRUE
-            ),
+          # if (any(is_shared)) {
+          #   shared_grid_raw_list[[i]] <- tibble(
+          #     GRID_ID   = sub("^grid_", "", rownames(gridsum)[is_shared]),
+          #     iteration = i,
+          #     value     = gridsum[is_shared, 1]
+          #   )
+          # }
 
-            vessel_iter_delta_q025 = matrixStats::rowQuantiles(
-              vesselsbygroup,
-              probs = 0.025,
-              na.rm = TRUE
-            ),
-
-            vessel_iter_delta_q975 = matrixStats::rowQuantiles(
-              vesselsbygroup,
-              probs = 0.975,
-              na.rm = TRUE
-            ),
-
-            vessel_iter_delta_n_delta_gt0 = matrixStats::rowCounts(
-              vesselsbygroup > 0,
-              value = TRUE,
-              na.rm = TRUE
-            )
-          ) |>
-            separate(group, into = c("type", "GRID_ID"), sep = "_", remove = TRUE)
+          if (any(is_shared)) {
+            shared_grid_raw_list[[i]] <- data.table::as.data.table(
+              gridsum[is_shared, , drop = FALSE],
+              keep.rownames = "GRID_ID"
+            ) |>
+              tidyr::pivot_longer(
+                cols = -GRID_ID,
+                names_to = "vessel_iter",
+                values_to = "value"
+              ) |>
+              mutate(
+                vessel_iter = as.numeric(sub("V", "", vessel_iter)),
+                iteration = i # whale iterations
+              )
+          }
         }
 
-        data.table::rbindlist(results_list)
+        zone_stats <- data.table::rbindlist(zone_results_list) |>
+          mutate(type = sub("^zone_", "", group)) |>
+          select(-group)
+
+        # unique grid cells: build matrix across iterations, stats now, no disk round-trip
+        unique_mat <- do.call(cbind, unique_grid_raw_list)
+        unique_grid_stats <- if (!is.null(unique_mat) && nrow(unique_mat) > 0) {
+          tibble(
+            GRID_ID = sub("^grid_", "", rownames(unique_mat)),
+            vessel_iter_delta_mean = matrixStats::rowMeans2(unique_mat, na.rm = TRUE),
+            vessel_iter_delta_median = matrixStats::rowMedians(unique_mat, na.rm = TRUE),
+            vessel_iter_delta_variance = matrixStats::rowVars(unique_mat, na.rm = TRUE),
+            vessel_iter_delta_q025 = matrixStats::rowQuantiles(unique_mat, probs = 0.025, na.rm = TRUE),
+            vessel_iter_delta_q975 = matrixStats::rowQuantiles(unique_mat, probs = 0.975, na.rm = TRUE),
+            vessel_iter_delta_n_delta_gt0 = matrixStats::rowCounts(unique_mat > 0, value = TRUE, na.rm = TRUE)
+          )
+        } else {
+          NA
+        }
+
+        # shared grid cells only: write raw values to parquet for later duckdb combine
+        shared_raw_long <- data.table::rbindlist(shared_grid_raw_list)
+        grid_raw_path <- NA_character_
+        if (nrow(shared_raw_long) > 0) {
+          out_path <- file.path(
+            get_store(), "grid_raw",
+            paste0("mc_grid_raw_", year_month, "_", tg_label, "_", zones, ".parquet")
+          )
+          tmp_path <- paste0(out_path, ".tmp")
+          dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+          arrow::write_parquet(shared_raw_long, tmp_path)
+          file.rename(tmp_path, out_path)
+          grid_raw_path <- out_path
+        }
+
+        list(
+          zone_stats = zone_stats,
+          unique_grid_stats = unique_grid_stats,
+          grid_raw_path = grid_raw_path
+        )
 
       } else {
-        NA
+        list(zone_stats = NA, unique_grid_stats = NA, grid_raw_path = NA_character_)
       }
-
     }
-  )
+  ),
+
+  # thin extraction targets -- no recomputation, just indexing the cached list
+  tar_target(mc_zone_stats, mc_results$zone_stats),
+  tar_target(mc_unique_grid_stats, mc_results$unique_grid_stats),
+  tar_target(mc_grid_raw_path, mc_results$grid_raw_path)
 )
 
+# NEW: combine unique (non-shared) grid stats across zones, per year_month/tg_label
+# -- these are already final, just need bind_rows across zones.
+data_grid_combine_values <- data_ais_growth |>
+  mutate(ym_tg = paste0(gsub("-", ".", year_month), "_", tg_label))
+
+mc_unique_grid_stats_targets <- flatten_targets(mapped_outputs)
+mc_unique_grid_stats_lookup <- setNames(
+  mc_unique_grid_stats_targets,
+  vapply(mc_unique_grid_stats_targets, function(x) x$settings$name, character(1))
+)
+
+mc_unique_grid_combined_targets <- lapply(
+  unique(data_grid_combine_values$ym_tg),
+  function(grp) {
+    sub <- data_grid_combine_values[data_grid_combine_values$ym_tg == grp, ]
+    target_names <- paste0("mc_unique_grid_stats_", grp, "_", sub$zones)
+
+    do.call(
+      tar_combine,
+      c(
+        list(name = paste0("mc_unique_grid_combined_", grp)),
+        mc_unique_grid_stats_lookup[target_names],
+        list(command = quote(dplyr::bind_rows(purrr::keep(list(!!!.x), is.data.frame))))
+      )
+    )
+  }
+)
+
+# NEW: combine shared grid cells' raw parquet files across zones via duckdb,
+# per year_month/tg_label
+mc_grid_raw_path_lookup <- setNames(
+  mc_unique_grid_stats_targets,
+  vapply(mc_unique_grid_stats_targets, function(x) x$settings$name, character(1))
+)
+
+mc_grid_combined_targets <- lapply(
+  unique(data_grid_combine_values$ym_tg),
+  function(grp) {
+    sub <- data_grid_combine_values[data_grid_combine_values$ym_tg == grp, ]
+    target_names <- paste0("mc_grid_raw_path_", grp, "_", sub$zones)
+
+    do.call(
+      tar_combine,
+      c(
+        list(name = paste0("mc_grid_combined_", grp)),
+        mc_grid_raw_path_lookup[target_names],
+        list(command = quote(combine_grid_raw_duckdb(c(!!!.x))))
+      )
+    )
+  }
+)
+
+# NEW: final shared-grid stats -- pivot the combined long table to a matrix,
+# run matrixStats once
+mc_shared_grid_stats_targets <- lapply(
+  unique(data_grid_combine_values$ym_tg),
+  function(grp) {
+    tar_target_raw(
+      name = paste0("mc_shared_grid_stats_", grp),
+      command = bquote({
+        long <- .(as.name(paste0("mc_grid_combined_", grp)))
+        if (is.data.frame(long) && nrow(long) > 0) {
+          wide <- tidyr::pivot_wider(long, names_from = iteration, values_from = value, values_fill = 0)
+          grid_mat <- as.matrix(wide[, -1])
+          rownames(grid_mat) <- wide$GRID_ID
+
+          tibble(
+            GRID_ID = rownames(grid_mat),
+            vessel_iter_delta_mean        = matrixStats::rowMeans2(grid_mat, na.rm = TRUE),
+            vessel_iter_delta_median      = matrixStats::rowMedians(grid_mat, na.rm = TRUE),
+            vessel_iter_delta_variance    = matrixStats::rowVars(grid_mat, na.rm = TRUE),
+            vessel_iter_delta_q025        = matrixStats::rowQuantiles(grid_mat, probs = 0.025, na.rm = TRUE),
+            vessel_iter_delta_q975        = matrixStats::rowQuantiles(grid_mat, probs = 0.975, na.rm = TRUE),
+            vessel_iter_delta_n_delta_gt0 = matrixStats::rowCounts(grid_mat > 0, value = TRUE, na.rm = TRUE)
+          )
+        } else {
+          NA
+        }
+      })
+    )
+  }
+)
+
+# NEW: final grid stats = union of unique-cell stats (already final) and
+# shared-cell stats (combined then finalized)
+mc_grid_stats_targets <- lapply(
+  unique(data_grid_combine_values$ym_tg),
+  function(grp) {
+    tar_target_raw(
+      name = paste0("mc_grid_stats_", grp),
+      command = bquote({
+        unique_part <- .(as.name(paste0("mc_unique_grid_combined_", grp)))
+        shared_part <- .(as.name(paste0("mc_shared_grid_stats_", grp)))
+        dplyr::bind_rows(
+          purrr::keep(list(unique_part, shared_part), is.data.frame)
+        )
+      })
+    )
+  }
+)
+
+mc_zone_stats_targets <- lapply(
+  unique(data_grid_combine_values$ym_tg),
+  function(grp) {
+    sub <- data_grid_combine_values[data_grid_combine_values$ym_tg == grp, ]
+    target_names <- paste0("mc_results_", grp, "_", sub$zones)
+
+    do.call(
+      tar_combine,
+      c(
+        list(name = paste0("mc_zone_stats_", grp)),
+        mc_unique_grid_stats_lookup[target_names],
+        list(command = quote(dplyr::bind_rows(purrr::keep(list(!!!.x), is.data.frame))))
+      )
+    )
+  }
+)
 
 list(
   tar_target(
@@ -585,160 +758,28 @@ list(
   tar_target(
     name = remove_grid_ids,
     command = c(
-      'ATW-1190',
-      'ATX-1190',
-      'ATV-1189',
-      'ATW-1189',
-      'ATX-1189',
-      'ATV-1188',
-      'ATW-1188',
-      'ATX-1188',
-      'ATY-1188',
-      'ATV-1187',
-      'ATW-1187',
-      'ATX-1187',
-      'ATY-1187',
-      'ATU-1186',
-      'ATV-1186',
-      'ATW-1186',
-      'ATX-1186',
-      'ATY-1186',
-      'ATT-1185',
-      'ATU-1185',
-      'ATV-1185',
-      'ATW-1185',
-      'ATX-1185',
-      'ATY-1185',
-      'ATZ-1185',
-      'ATT-1184',
-      'ATU-1184',
-      'ATV-1184',
-      'ATW-1184',
-      'ATX-1184',
-      'ATY-1184',
-      'ATZ-1184',
-      'ATU-1183',
-      'ATV-1183',
-      'ATW-1183',
-      'ATX-1183',
-      'ATY-1183',
-      'ATZ-1183',
-      'AUA-1183',
-      'ATU-1182',
-      'ATV-1182',
-      'ATW-1182',
-      'ATX-1182',
-      'ATY-1182',
-      'ATZ-1182',
-      'AUA-1182',
-      'ATU-1181',
-      'ATV-1181',
-      'ATW-1181',
-      'ATX-1181',
-      'ATY-1181',
-      'ATZ-1181',
-      'AUA-1181',
-      'AUB-1181',
-      'ATU-1180',
-      'ATV-1180',
-      'ATW-1180',
-      'ATX-1180',
-      'ATY-1180',
-      'ATZ-1180',
-      'AUA-1180',
-      'AUB-1180',
-      'ATU-1179',
-      'ATV-1179',
-      'ATW-1179',
-      'ATX-1179',
-      'ATY-1179',
-      'ATZ-1179',
-      'AUA-1179',
-      'AUB-1179',
-      'ATU-1178',
-      'ATV-1178',
-      'ATW-1178',
-      'ATX-1178',
-      'ATY-1178',
-      'ATZ-1178',
-      'AUA-1178',
-      'AUB-1178',
-      'ATU-1177',
-      'ATV-1177',
-      'ATW-1177',
-      'ATX-1177',
-      'ATY-1177',
-      'ATZ-1177',
-      'AUA-1177',
-      'AUB-1177',
-      'AUC-1177',
-      'ATV-1176',
-      'ATW-1176',
-      'ATX-1176',
-      'ATY-1176',
-      'ATZ-1176',
-      'AUA-1176',
-      'AUB-1176',
-      'AUC-1176',
-      'ATV-1175',
-      'ATW-1175',
-      'ATX-1175',
-      'ATY-1175',
-      'ATZ-1175',
-      'AUA-1175',
-      'AUB-1175',
-      'AUC-1175',
-      'ATV-1174',
-      'ATW-1174',
-      'ATX-1174',
-      'ATY-1174',
-      'ATZ-1174',
-      'AUA-1174',
-      'AUB-1174',
-      'ATU-1173',
-      'ATV-1173',
-      'ATW-1173',
-      'ATX-1173',
-      'ATY-1173',
-      'ATZ-1173',
-      'AUA-1173',
-      'AUB-1173',
-      'AUC-1173',
-      'ATU-1172',
-      'ATV-1172',
-      'ATW-1172',
-      'ATX-1172',
-      'ATY-1172',
-      'ATZ-1172',
-      'AUA-1172',
-      'AUB-1172',
-      'AUC-1172',
-      'ATU-1171',
-      'ATV-1171',
-      'ATW-1171',
-      'ATX-1171',
-      'ATY-1171',
-      'ATZ-1171',
-      'AUA-1171',
-      'AUB-1171',
-      'AUC-1171',
-      'ATV-1170',
-      'ATW-1170',
-      'ATX-1170',
-      'ATY-1170',
-      'ATZ-1170',
-      'AUA-1170',
-      'AUB-1170',
-      'AUC-1170',
-      'ATU-1169',
-      'ATV-1169',
-      'ATW-1169',
-      'ATX-1169',
-      'ATY-1169',
-      'ATZ-1169',
-      'AUA-1169',
-      'AUB-1169',
-      'AUC-1169'
+      'ATW-1190','ATX-1190','ATV-1189','ATW-1189','ATX-1189','ATV-1188','ATW-1188',
+      'ATX-1188','ATY-1188','ATV-1187','ATW-1187','ATX-1187','ATY-1187','ATU-1186',
+      'ATV-1186','ATW-1186','ATX-1186','ATY-1186','ATT-1185','ATU-1185','ATV-1185',
+      'ATW-1185','ATX-1185','ATY-1185','ATZ-1185','ATT-1184','ATU-1184','ATV-1184',
+      'ATW-1184','ATX-1184','ATY-1184','ATZ-1184','ATU-1183','ATV-1183','ATW-1183',
+      'ATX-1183','ATY-1183','ATZ-1183','AUA-1183','ATU-1182','ATV-1182','ATW-1182',
+      'ATX-1182','ATY-1182','ATZ-1182','AUA-1182','ATU-1181','ATV-1181','ATW-1181',
+      'ATX-1181','ATY-1181','ATZ-1181','AUA-1181','AUB-1181','ATU-1180','ATV-1180',
+      'ATW-1180','ATX-1180','ATY-1180','ATZ-1180','AUA-1180','AUB-1180','ATU-1179',
+      'ATV-1179','ATW-1179','ATX-1179','ATY-1179','ATZ-1179','AUA-1179','AUB-1179',
+      'ATU-1178','ATV-1178','ATW-1178','ATX-1178','ATY-1178','ATZ-1178','AUA-1178',
+      'AUB-1178','ATU-1177','ATV-1177','ATW-1177','ATX-1177','ATY-1177','ATZ-1177',
+      'AUA-1177','AUB-1177','AUC-1177','ATV-1176','ATW-1176','ATX-1176','ATY-1176',
+      'ATZ-1176','AUA-1176','AUB-1176','AUC-1176','ATV-1175','ATW-1175','ATX-1175',
+      'ATY-1175','ATZ-1175','AUA-1175','AUB-1175','AUC-1175','ATV-1174','ATW-1174',
+      'ATX-1174','ATY-1174','ATZ-1174','AUA-1174','AUB-1174','ATU-1173','ATV-1173',
+      'ATW-1173','ATX-1173','ATY-1173','ATZ-1173','AUA-1173','AUB-1173','AUC-1173',
+      'ATU-1172','ATV-1172','ATW-1172','ATX-1172','ATY-1172','ATZ-1172','AUA-1172',
+      'AUB-1172','AUC-1172','ATU-1171','ATV-1171','ATW-1171','ATX-1171','ATY-1171',
+      'ATZ-1171','AUA-1171','AUB-1171','AUC-1171','ATV-1170','ATW-1170','ATX-1170',
+      'ATY-1170','ATZ-1170','AUA-1170','AUB-1170','AUC-1170','ATU-1169','ATV-1169',
+      'ATW-1169','ATX-1169','ATY-1169','ATZ-1169','AUA-1169','AUB-1169','AUC-1169'
     )
   ),
 
@@ -784,9 +825,15 @@ list(
   mapped_data_ais_layers,
   mapped_data_ais_zones,
   allwhales_targets,
+  mapped_shared_grid,               # NEW: identifies multi-zone grid cells per month
   mapped_trip_counts,
   combined_trip_counts_targets,
   mapped_trip_nums,
   mapped_mc_sampling,
-  mapped_outputs
+  mapped_outputs,                   # now produces mc_results -> mc_zone_stats, mc_unique_grid_stats, mc_grid_raw_path
+  mc_unique_grid_combined_targets,  # NEW: bind_rows of already-final unique-cell stats
+  mc_grid_combined_targets,         # NEW: duckdb-combined shared-cell raw values
+  mc_shared_grid_stats_targets,     # NEW: matrixStats on combined shared cells
+  mc_grid_stats_targets,            # NEW: final union of unique + shared grid stats
+  mc_zone_stats_targets
 )
