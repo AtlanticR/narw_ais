@@ -8,6 +8,9 @@ get_store <- function(){
   if(dir.exists("D:/Data_For_Remi/narw_ais")) {
     # on the HDD
     store = "D:/Data_For_Remi/narw_ais"
+  } else if(dir.exists("W:/SPA/NARW_AIS")) {
+    # on the NAS directly via windows
+    store = "W:/SPA/NARW_AIS"
   } else if(dir.exists("//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/SPA/NARW_AIS")) {
     # on the NAS from windows
     store = "//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/SPA/NARW_AIS"

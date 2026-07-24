@@ -15,24 +15,28 @@ pkgs <- c(
   "dplyr",
   "arrow",
   "duckdb",
-  "DBI"
+  "DBI",
+  "Matrix"
 )
 
 
 shelf(pkgs)
 
 tar_option_set(
-  # controller = crew_controller_group(
-  #   local = crew_controller_local(
-  #     workers = 2
-  #   )
-  # ),
+  controller = crew_controller_group(
+    local = crew_controller_local(
+      workers = 4
+    )
+  ),
   packages = basename(pkgs),
   format = "qs"
 )
 
 # get the path to the data store
-source("R/get_store.R")
+get_store <- local({
+  f <- source("R/get_store.R", local = TRUE)$value
+  function(...) f(...)
+})
 
 tar_config_set(store = file.path(get_store(), "targets"))
 
@@ -40,12 +44,13 @@ tar_source("R/assign_trip_ids.R")
 
 data_ais_layers <- tibble(
   year_month = c("2023-11", paste0("2024-", sprintf("%02d", 4:10)))
-  # year_month = c(paste0("2024-", sprintf("%02d", 8:9)))
+  # year_month = c(paste0("2024-", sprintf("%02d", 8:9))) #for small scale testing
 )
 
 data_ais_zones <- expand.grid(
   year_month    = data_ais_layers$year_month,
   zones = sub(".*SEGS_([^_]+)_Unaffected.*", "\\1",list.files(file.path(get_store(),"Increased_Traffic"), recursive = TRUE, full.names = TRUE, pattern = paste0("resultsIterations_2024-08.*\\.RData"))),
+  # zones = c("SM1","SM2","DSZD"), #for small scale testing
   stringsAsFactors = FALSE
 ) |>
   mutate(
@@ -80,7 +85,6 @@ data_ais_growth <- expand.grid(
         tg_label
       )
     ),
-    # NEW: each zone branch gets a reference to its month's shared-grid-id vector
     shared_grid_ids = rlang::syms(paste0("shared_grid_ids_", gsub("-", ".", year_month)))
   )
 
@@ -262,23 +266,14 @@ build_group_combine_targets <- function(mapped_result, values, group_col, name_p
   )
 }
 
-# NEW: combine shared-grid-cell raw parquet files across zones via duckdb
-combine_grid_raw_duckdb <- function(paths) {
-  paths <- paths[!is.na(paths)]
-  if (length(paths) == 0) return(NA)
-
-  con <- DBI::dbConnect(duckdb::duckdb())
-  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
-
-  glob <- paste0("['", paste(paths, collapse = "','"), "']")
-
-  DBI::dbGetQuery(con, sprintf(
-    "SELECT GRID_ID, vessel_iter, iteration, SUM(value) AS value
-     FROM read_parquet(%s)
-     GROUP BY GRID_ID, whale_iter",
-    glob
-  ))
-}
+# ===========================================================================
+# CHANGED: this is the core of the refactor. See R/mc_group_stats.R (sourced
+# below) for compute_group_stats() / compute_group_raw_long() -- these
+# replace the old whale-iteration for-loop with one matmul per zone/grid
+# group. Kept out of _targets.R proper so it's easy to unit-test in
+# isolation with a small synthetic D/S before trusting it on a 43GB zone.
+# ===========================================================================
+tar_source("R/mc_group_stats.R")
 
 allwhales_targets <- build_group_combine_targets(
   mapped_result = mapped_data_ais_zones,
@@ -289,7 +284,6 @@ allwhales_targets <- build_group_combine_targets(
   extra_cols    = "zones"
 )
 
-# NEW: identify grid cells that appear in more than one zone, per year_month
 data_shared_grid_values <- data_ais_layers |>
   mutate(
     data_allwhaleskey = rlang::syms(paste0("data_allwhaleskey_", gsub("-", ".", year_month)))
@@ -420,7 +414,9 @@ mapped_mc_sampling <- tar_map(
           seq_len(n_iter),
           lengths(sampled_indices)
         ),
-        x = TRUE,
+        x = 1,               # CHANGED: numeric 1 instead of TRUE, so mc_sampled_trips
+        # is guaranteed dgCMatrix (numeric), not lgCMatrix --
+        # matters once this feeds a %*% against a dense numeric D
         dims = c(
           nrow(trip_lookup),
           n_iter
@@ -445,8 +441,31 @@ mapped_mc_sampling <- tar_map(
   )
 )
 
-# computes zone stats, finalizes unique (non-shared) grid cell stats
-# in-memory, and writes only shared grid cells' raw values to parquet.
+# ===========================================================================
+# CHANGED: mc_results no longer loops over the 10,000 whale iterations.
+# Old behaviour: for each whale iteration, build a dense (n_events x
+# n_vessel_iter) NA-filled matrix, then rowsum() it by group. For a 43GB
+# zone (~500k events) that's a ~40GB scratch matrix built and freed 10,000
+# times.
+#
+# New behaviour: mc_sampled_mask (S) is already the event x vessel_iter
+# selection matrix, and it's the SAME for every whale iteration -- so the
+# whole per-whale-iteration loop collapses into one matrix multiply per
+# zone/grid group: R_group = D[, group cols] %*% S[group cols, ]. R_group is
+# whale_iter x vessel_iter; matrixStats row-functions across the vessel_iter
+# axis give exactly the same per-whale-iteration statistics the old loop
+# computed, without ever building the full masked matrix.
+#
+# Zones: handful of groups, trivially cheap.
+# Unique-zone grid cells: looped, but each iteration is one small matmul +
+#   immediate reduction to a stats row -- R_group (800MB) is discarded before
+#   moving to the next grid cell, so peak memory stays bounded regardless of
+#   how many grid cells there are.
+# Shared grid cells: same per-group matmul, but instead of reducing to stats
+#   immediately, melts R_group to long format and writes it to parquet --
+#   stats aren't valid until contributions from every zone containing that
+#   grid cell are summed (see mc_shared_grid_stats_targets below).
+# ===========================================================================
 mapped_outputs <- tar_map(
   values = data_ais_growth,
   names  = c(year_month, tg_label, zones),
@@ -509,108 +528,76 @@ mapped_outputs <- tar_map(
     mc_results,
     command = {
       if (is.data.frame(data_whaleskey)) {
-        # mask <- as.matrix(mc_sampled_mask)
-        idx <- Matrix::summary(mc_sampled_mask)
 
-        zone_groups <- as.factor(data_whaleskey$zone1)
-        grid_groups <- as.factor(data_whaleskey$GRID_ID)
-        grid_id_levels <- levels(grid_groups)
-        is_shared <- grid_id_levels %in% shared_grid_ids
+        whales_dt <- as.data.table(data_whaleskey)
 
-        n_iter <- nrow(data_whaleresults_matrix)
+        stopifnot(
+          nrow(whales_dt) == ncol(data_whaleresults_matrix)
+        )
 
-        zone_results_list    <- vector("list", n_iter)
-        unique_grid_raw_list <- vector("list", n_iter)
-        shared_grid_raw_list <- vector("list", n_iter)
+        # NOTE these vectors stay full-length, aligned to columns of
+        # data_whaleresults_matrix / rows of mc_sampled_mask -- do not
+        # subset them, only subset which *group ids* get iterated over.
+        zone_vec <- whales_dt$zone1
+        grid_vec <- whales_dt$GRID_ID
 
-        for (i in seq_len(n_iter)) {
-          if (i %% floor(n_iter / 10L) == 0L) {
-            message("iteration ", i, " of ", n_iter)
-          }
+        grid_id_levels <- unique(grid_vec)
+        is_shared_grid  <- grid_id_levels %in% shared_grid_ids
+        unique_grid_ids <- grid_id_levels[!is_shared_grid]
+        shared_grid_ids_here <- grid_id_levels[is_shared_grid]
 
-          # maskedvessels <- mask * data_whaleresults_matrix[i, ]
-          maskedvessels <- matrix(NA_real_,
-                                  nrow = nrow(mc_sampled_mask),
-                                  ncol = ncol(mc_sampled_mask))
-
-          maskedvessels[cbind(idx$i, idx$j)] <- data_whaleresults_matrix[i, ][idx$i]
-
-          # zone stats -- unchanged logic, computed immediately per iteration
-          vesselsbygroup <- rowsum(maskedvessels, group = zone_groups, na.rm = TRUE)
-          zone_results_list[[i]] <- tibble(
-            whale_iter = i,
-            group = rownames(vesselsbygroup),
-            vessel_iter_delta_mean = matrixStats::rowMeans2(vesselsbygroup, na.rm = TRUE),
-            vessel_iter_delta_median = matrixStats::rowMedians(vesselsbygroup, na.rm = TRUE),
-            vessel_iter_delta_variance = matrixStats::rowVars(vesselsbygroup, na.rm = TRUE),
-            vessel_iter_delta_q025 = matrixStats::rowQuantiles(vesselsbygroup, probs = 0.025, na.rm = TRUE),
-            vessel_iter_delta_q975 = matrixStats::rowQuantiles(vesselsbygroup, probs = 0.975, na.rm = TRUE),
-            vessel_iter_delta_n_delta_gt0 = matrixStats::rowCounts(vesselsbygroup > 0, value = TRUE, na.rm = TRUE)
-          )
-
-          # grid -- one rowsum, then split by shared vs. unique
-          gridsum <- rowsum(maskedvessels, group = grid_groups, na.rm = TRUE)
-
-          unique_grid_raw_list[[i]] <- gridsum[!is_shared, , drop = FALSE]
-
-          # if (any(is_shared)) {
-          #   shared_grid_raw_list[[i]] <- tibble(
-          #     GRID_ID   = sub("^grid_", "", rownames(gridsum)[is_shared]),
-          #     iteration = i,
-          #     value     = gridsum[is_shared, 1]
-          #   )
-          # }
-
-          if (any(is_shared)) {
-            shared_grid_raw_list[[i]] <- data.table::as.data.table(
-              gridsum[is_shared, , drop = FALSE],
-              keep.rownames = "GRID_ID"
-            ) |>
-              tidyr::pivot_longer(
-                cols = -GRID_ID,
-                names_to = "vessel_iter",
-                values_to = "value"
-              ) |>
-              mutate(
-                vessel_iter = as.numeric(sub("V", "", vessel_iter)),
-                iteration = i # whale iterations
-              )
-          }
-        }
-
-        zone_stats <- data.table::rbindlist(zone_results_list) |>
+        # -- zones: small number of groups --
+        zone_stats <- compute_group_stats(
+          D = data_whaleresults_matrix,
+          S = mc_sampled_mask,
+          group_vec = zone_vec,
+          groups = unique(zone_vec),
+          group_col_name = "group"
+        ) |>
           mutate(type = sub("^zone_", "", group)) |>
           select(-group)
 
-        # unique grid cells: build matrix across iterations, stats now, no disk round-trip
-        unique_mat <- do.call(cbind, unique_grid_raw_list)
-        unique_grid_stats <- if (!is.null(unique_mat) && nrow(unique_mat) > 0) {
-          tibble(
-            GRID_ID = sub("^grid_", "", rownames(unique_mat)),
-            vessel_iter_delta_mean = matrixStats::rowMeans2(unique_mat, na.rm = TRUE),
-            vessel_iter_delta_median = matrixStats::rowMedians(unique_mat, na.rm = TRUE),
-            vessel_iter_delta_variance = matrixStats::rowVars(unique_mat, na.rm = TRUE),
-            vessel_iter_delta_q025 = matrixStats::rowQuantiles(unique_mat, probs = 0.025, na.rm = TRUE),
-            vessel_iter_delta_q975 = matrixStats::rowQuantiles(unique_mat, probs = 0.975, na.rm = TRUE),
-            vessel_iter_delta_n_delta_gt0 = matrixStats::rowCounts(unique_mat > 0, value = TRUE, na.rm = TRUE)
-          )
+        # -- unique-zone grid cells: stats finalized immediately, no disk round-trip --
+        unique_grid_stats <- if (length(unique_grid_ids) > 0) {
+          compute_group_stats(
+            D = data_whaleresults_matrix,
+            S = mc_sampled_mask,
+            group_vec = grid_vec,
+            groups = unique_grid_ids,
+            group_col_name = "GRID_ID"
+          ) |>
+            mutate(GRID_ID = sub("^grid_", "", GRID_ID))
         } else {
           NA
         }
 
-        # shared grid cells only: write raw values to parquet for later duckdb combine
-        shared_raw_long <- data.table::rbindlist(shared_grid_raw_list)
+        # -- shared grid cells only: write this zone's raw contribution to parquet --
         grid_raw_path <- NA_character_
-        if (nrow(shared_raw_long) > 0) {
-          out_path <- file.path(
-            get_store(), "grid_raw",
-            paste0("mc_grid_raw_", year_month, "_", tg_label, "_", zones, ".parquet")
-          )
-          tmp_path <- paste0(out_path, ".tmp")
-          dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
-          arrow::write_parquet(shared_raw_long, tmp_path)
-          file.rename(tmp_path, out_path)
-          grid_raw_path <- out_path
+        if (length(shared_grid_ids_here) > 0) {
+          shared_raw_long <- purrr::map_dfr(
+            shared_grid_ids_here,
+            function(g) {
+              compute_group_raw_long(
+                D = data_whaleresults_matrix,
+                S = mc_sampled_mask,
+                group_vec = grid_vec,
+                group_id = g
+              )
+            }
+          ) |>
+            mutate(GRID_ID = sub("^grid_", "", GRID_ID))
+
+          if (nrow(shared_raw_long) > 0) {
+            out_path <- file.path(
+              get_store(), "grid_raw",
+              paste0("mc_grid_raw_", year_month, "_", tg_label, "_", zones, ".parquet")
+            )
+            tmp_path <- paste0(out_path, ".tmp")
+            dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+            arrow::write_parquet(shared_raw_long, tmp_path)
+            file.rename(tmp_path, out_path)
+            grid_raw_path <- out_path
+          }
         }
 
         list(
@@ -625,14 +612,11 @@ mapped_outputs <- tar_map(
     }
   ),
 
-  # thin extraction targets -- no recomputation, just indexing the cached list
   tar_target(mc_single_zone_stats, mc_results$zone_stats),
   tar_target(mc_unique_grid_stats, mc_results$unique_grid_stats),
   tar_target(mc_grid_raw_path, mc_results$grid_raw_path)
 )
 
-# NEW: combine unique (non-shared) grid stats across zones, per year_month/tg_label
-# -- these are already final, just need bind_rows across zones.
 data_grid_combine_values <- data_ais_growth |>
   mutate(ym_tg = paste0(gsub("-", ".", year_month), "_", tg_label))
 
@@ -659,14 +643,59 @@ mc_unique_grid_combined_targets <- lapply(
   }
 )
 
-# NEW: combine shared grid cells' raw parquet files across zones via duckdb,
-# per year_month/tg_label
+# ===========================================================================
+# CHANGED: mc_grid_combined_targets (raw cross-zone sum) and
+# mc_shared_grid_stats_targets (pivot + matrixStats) used to be two separate
+# steps. That old two-step approach also had the axis bug described above:
+# it pivoted on `iteration` (whale) as columns, so ended up computing stats
+# per (GRID_ID, vessel_iter) across whale iterations -- backwards relative
+# to zone_stats/unique_grid_stats.
+#
+# It's also not viable to fix by just pivoting the other way in R: a full
+# cross-zone-combined long table pivoted to (GRID_ID x whale_iter) rows by
+# vessel_iter columns would be n_shared_grids * 10000 rows x 10000 columns --
+# far too large to materialize as a dense R matrix if there are more than a
+# handful of shared grid cells.
+#
+# Fix: do the cross-zone SUM and the per-(GRID_ID, whale_iter) stats in one
+# DuckDB query, grouped correctly, never materializing a dense matrix or a
+# giant combined long table in R at all. Only the final small stats table
+# (n_shared_grids * 10000 rows x 6 stat columns) comes back to R.
+# ===========================================================================
 mc_grid_raw_path_lookup <- setNames(
   mc_unique_grid_stats_targets,
   vapply(mc_unique_grid_stats_targets, function(x) x$settings$name, character(1))
 )
 
-mc_grid_combined_targets <- lapply(
+combine_and_stat_shared_grids_duckdb <- function(paths) {
+  paths <- paths[!is.na(paths)]
+  if (length(paths) == 0) return(NA)
+
+  con <- DBI::dbConnect(duckdb::duckdb())
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+
+  glob <- paste0("['", paste(paths, collapse = "','"), "']")
+
+  DBI::dbGetQuery(con, sprintf(
+    "WITH combined AS (
+       SELECT GRID_ID, whale_iter, vessel_iter, SUM(value) AS value
+       FROM read_parquet(%s)
+       GROUP BY GRID_ID, whale_iter, vessel_iter
+     )
+     SELECT GRID_ID, whale_iter,
+            AVG(value)                                   AS vessel_iter_delta_mean,
+            MEDIAN(value)                                AS vessel_iter_delta_median,
+            VAR_SAMP(value)                               AS vessel_iter_delta_variance,
+            QUANTILE_CONT(value, 0.025)                  AS vessel_iter_delta_q025,
+            QUANTILE_CONT(value, 0.975)                  AS vessel_iter_delta_q975,
+            SUM(CASE WHEN value > 0 THEN 1 ELSE 0 END)   AS vessel_iter_delta_n_delta_gt0
+     FROM combined
+     GROUP BY GRID_ID, whale_iter",
+    glob
+  ))
+}
+
+mc_shared_grid_stats_targets <- lapply(
   unique(data_grid_combine_values$ym_tg),
   function(grp) {
     sub <- data_grid_combine_values[data_grid_combine_values$ym_tg == grp, ]
@@ -675,47 +704,14 @@ mc_grid_combined_targets <- lapply(
     do.call(
       tar_combine,
       c(
-        list(name = paste0("mc_grid_combined_", grp)),
+        list(name = paste0("mc_shared_grid_stats_", grp)),
         mc_grid_raw_path_lookup[target_names],
-        list(command = quote(combine_grid_raw_duckdb(c(!!!.x))))
+        list(command = quote(combine_and_stat_shared_grids_duckdb(c(!!!.x))))
       )
     )
   }
 )
 
-# NEW: final shared-grid stats -- pivot the combined long table to a matrix,
-# run matrixStats once
-mc_shared_grid_stats_targets <- lapply(
-  unique(data_grid_combine_values$ym_tg),
-  function(grp) {
-    tar_target_raw(
-      name = paste0("mc_shared_grid_stats_", grp),
-      command = bquote({
-        long <- .(as.name(paste0("mc_grid_combined_", grp)))
-        if (is.data.frame(long) && nrow(long) > 0) {
-          wide <- tidyr::pivot_wider(long, names_from = iteration, values_from = value, values_fill = 0)
-          grid_mat <- as.matrix(wide[, -1])
-          rownames(grid_mat) <- wide$GRID_ID
-
-          tibble(
-            GRID_ID = rownames(grid_mat),
-            vessel_iter_delta_mean        = matrixStats::rowMeans2(grid_mat, na.rm = TRUE),
-            vessel_iter_delta_median      = matrixStats::rowMedians(grid_mat, na.rm = TRUE),
-            vessel_iter_delta_variance    = matrixStats::rowVars(grid_mat, na.rm = TRUE),
-            vessel_iter_delta_q025        = matrixStats::rowQuantiles(grid_mat, probs = 0.025, na.rm = TRUE),
-            vessel_iter_delta_q975        = matrixStats::rowQuantiles(grid_mat, probs = 0.975, na.rm = TRUE),
-            vessel_iter_delta_n_delta_gt0 = matrixStats::rowCounts(grid_mat > 0, value = TRUE, na.rm = TRUE)
-          )
-        } else {
-          NA
-        }
-      })
-    )
-  }
-)
-
-# NEW: final grid stats = union of unique-cell stats (already final) and
-# shared-cell stats (combined then finalized)
 mc_grid_stats_targets <- lapply(
   unique(data_grid_combine_values$ym_tg),
   function(grp) {
@@ -825,15 +821,14 @@ list(
   mapped_data_ais_layers,
   mapped_data_ais_zones,
   allwhales_targets,
-  mapped_shared_grid,               # NEW: identifies multi-zone grid cells per month
+  mapped_shared_grid,
   mapped_trip_counts,
   combined_trip_counts_targets,
   mapped_trip_nums,
   mapped_mc_sampling,
-  mapped_outputs,                   # now produces mc_results -> mc_single_zone_stats, mc_unique_grid_stats, mc_grid_raw_path
-  mc_unique_grid_combined_targets,  # NEW: bind_rows of already-final unique-cell stats
-  mc_grid_combined_targets,         # NEW: duckdb-combined shared-cell raw values
-  mc_shared_grid_stats_targets,     # NEW: matrixStats on combined shared cells
-  mc_grid_stats_targets,            # NEW: final union of unique + shared grid stats
+  mapped_outputs,
+  mc_unique_grid_combined_targets,
+  mc_shared_grid_stats_targets,     # CHANGED: now does cross-zone sum + stats in one DuckDB query
+  mc_grid_stats_targets,
   mc_zone_stats_targets
 )
