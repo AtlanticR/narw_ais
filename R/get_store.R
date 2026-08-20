@@ -4,22 +4,29 @@
 #' @export
 #'
 #' @examples
-get_store <- function(){
-  if(dir.exists("D:/Data_For_Remi/narw_ais")) {
+get_store <- function() {
+  if (dir.exists("/gpfs/fs7/dfo/bioios/dar002/NARW_AIS/NARW_AIS/")) {
+    # on the GPSC
+    store <- "/gpfs/fs7/dfo/bioios/dar002/NARW_AIS/NARW_AIS/"
+  } else if (dir.exists("D:/Data_For_Remi/narw_ais")) {
     # on the HDD
-    store = "D:/Data_For_Remi/narw_ais"
-  } else if(dir.exists("W:/SPA/NARW_AIS")) {
+    store <- "D:/Data_For_Remi/narw_ais"
+  } else if (dir.exists("W:/SPA/NARW_AIS")) {
     # on the NAS directly via windows
-    store = "W:/SPA/NARW_AIS"
-  } else if(dir.exists("//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/SPA/NARW_AIS")) {
+    store <- "W:/SPA/NARW_AIS"
+  } else if (
+    dir.exists(
+      "//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/SPA/NARW_AIS"
+    )
+  ) {
     # on the NAS from windows
-    store = "//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/SPA/NARW_AIS"
-  } else if(dir.exists("~/ocean_data")) {
+    store <- "//ci-WPNSBIO9039519-smb-1.mar.dfo-mpo.ca/ocean_data/SPA/NARW_AIS"
+  } else if (dir.exists("~/ocean_data")) {
     # on the NAS from linux
-    store = normalizePath("~/ocean_data/SPA/NARW_AIS")
+    store <- normalizePath("~/ocean_data/SPA/NARW_AIS")
   } else if (dir.exists("/srv/sambashare/NARW/SPA/NARW_AIS")) {
     # on a linux machine on the sambashare
-    store = "/srv/sambashare/NARW"
+    store <- "/srv/sambashare/NARW"
   } else if (
     dir.exists(
       "//wpnsbio9039519.mar.dfo-mpo.ca/sambashare/NARW"
@@ -28,7 +35,7 @@ get_store <- function(){
     # on a windows machine on the sambashare
     store <- "//wpnsbio9039519.mar.dfo-mpo.ca/sambashare/NARW"
   } else {
-    store <-  getwd()
+    store <- getwd()
   }
 
   return(store)
